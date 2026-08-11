@@ -8,19 +8,32 @@
 #include "cuda_host.h"
 #include "hadamard.h"
 
-#include "norm.cuh"
 #include "hgemm.cuh"
 #include "rope.cuh"
-#include "activation.cuh"
-#include "softcap.cuh"
-#include "routing.cuh"
-#include "gdn.cuh"
 #include "add.cuh"
+#include "gdn.cuh"
 
-#include "quant/quantize.cuh"
 #include "quant/pack.cuh"
 #include "quant/reconstruct.cuh"
 #include "quant/hadamard.cuh"
+
+#include "generator/strings.h"
+#include "generator/sampling_basic.cuh"
+#include "generator/sampling_extra.cuh"
+#include "generator/gumbel.cuh"
+#include "generator/rep_pen.cuh"
+#include "generator/cache.cuh"
+
+#if !defined(USE_ROCM)
+// Category A + C: excluded from ROCm build (PyTorch native or PTX tensor-core)
+#include "norm.cuh"
+#include "activation.cuh"
+#include "softcap.cuh"
+#include "routing.cuh"
+#include "attention.cuh"
+#include "histogram.cuh"
+
+#include "quant/quantize.cuh"
 #include "quant/exl3_gemm.cuh"
 #include "quant/exl3_gemv.cuh"
 #include "quant/exl3_gemv_int8.cuh"
@@ -31,17 +44,8 @@
 #include "quant/exl3_devctx.cuh"
 #include "quant/exl3_moe.cuh"
 
-#include "generator/strings.h"
-#include "generator/sampling_basic.cuh"
-#include "generator/sampling_extra.cuh"
-#include "generator/gumbel.cuh"
 #include "generator/sampling_fused.cuh"
-#include "generator/rep_pen.cuh"
-#include "generator/cache.cuh"
-
 #include "cache/q_cache.cuh"
-
-#include "histogram.cuh"
 
 #include "parallel/context.cuh"
 #include "parallel/broadcast.cuh"
@@ -62,12 +66,12 @@
 #include "dsa_topk.cuh"
 #include "hc_mix.cuh"
 
-#include "attention.cuh"
-
 #include "sam.h"
+#endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    // ---- Category B: always available (compile under both CUDA and ROCm) ----
     m.def("stloader_read", &stloader_read, "stloader_read");
     m.def("stloader_open_file", &stloader_open_file, "stloader_open_file");
     m.def("stloader_close_file", &stloader_close_file, "stloader_close_file");
@@ -81,6 +85,45 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_host_get_device_pointer", &cuda_host_get_device_pointer, py::arg("ptr"));
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
 
+    m.def("had_paley", &had_paley, "had_paley");
+    m.def("had_paley2", &had_paley2, "had_paley2");
+
+    m.def("hgemm", &hgemm, "hgemm");
+    m.def("rope", &rope, "rope");
+    m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
+    m.def("reconstruct", &reconstruct, "reconstruct");
+    m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
+    m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
+    m.def("had_r_128", &had_r_128, "had_r_128");
+    m.def("pack_trellis", &pack_trellis, "pack_trellis");
+    m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
+    m.def("pack_signs", &pack_signs, "pack_signs");
+
+    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
+    m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
+    m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
+    m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
+    m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
+    m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
+    m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
+
+    m.def("argmax_sample", &argmax_sample, "argmax_sample");
+    m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
+    m.def("gumbel_noise_f16", &gumbel_noise_f16, "gumbel_noise_f16");
+    m.def("gumbel_noise_f32", &gumbel_noise_f32, "gumbel_noise_f32");
+    m.def("gumbel_noise_log", &gumbel_noise_log, "gumbel_noise_log");
+    m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
+    m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
+    m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
+
+    m.def("cache_rotate", &cache_rotate, "cache_rotate");
+    m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
+
+    m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
+    m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
+
+#if !defined(USE_ROCM)
+    // ---- Category A + C: only on CUDA (excluded from ROCm build) ----
     m.def("rms_norm", &rms_norm, "rms_norm");
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
@@ -99,9 +142,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("routing_std", &routing_std, "routing_std");
     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
-    m.def("had_paley", &had_paley, "had_paley");
-    m.def("had_paley2", &had_paley2, "had_paley2");
-
     m.def("pg_init_context", &pg_init_context, "pg_init_context");
     m.def("pg_broadcast", &pg_broadcast, "pg_broadcast");
     m.def("pg_broadcast_ll", &pg_broadcast_ll, "pg_broadcast_ll");
@@ -116,13 +156,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
     m.def("test_distribution", &test_distribution, "test_distribution");
     m.def("decode", &decode, "decode");
-    m.def("pack_trellis", &pack_trellis, "pack_trellis");
-    m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
-    m.def("pack_signs", &pack_signs, "pack_signs");
-    m.def("reconstruct", &reconstruct, "reconstruct");
-    m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
-    m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
-    m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
@@ -144,9 +177,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
-    m.def("hgemm", &hgemm, "hgemm");
-    m.def("rope", &rope, "rope");
-    m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
+
     m.def("silu_mul", &silu_mul, "silu_mul");
     m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");
     m.def("gelu_mul", &gelu_mul, "gelu_mul");
@@ -161,14 +192,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
 
-    m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
-    m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
-    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
-    m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
-    m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
-    m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
-    m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
-
     py::class_<ConvRewindJob>(m, "ConvRewindJob")
         .def(py::init<uintptr_t, uintptr_t, int, int, int>());
     py::class_<StateRewindJob>(m, "StateRewindJob")
@@ -176,25 +199,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
     m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
 
-    m.def("argmax_sample", &argmax_sample, "argmax_sample");
-    m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
-    m.def("gumbel_noise_f16", &gumbel_noise_f16, "gumbel_noise_f16");
-    m.def("gumbel_noise_f32", &gumbel_noise_f32, "gumbel_noise_f32");
-    m.def("gumbel_noise_log", &gumbel_noise_log, "gumbel_noise_log");
     m.def("fused_sampler", &fused_sampler, "fused_sampler");
     m.def("apply_logit_bitmask", &apply_logit_bitmask, "apply_logit_bitmask");
     m.attr("FUSED_SAMPLER_MAX_BLOCKS") = FUSED_SAMPLER_MAX_BLOCKS;
     m.attr("FUSED_SAMPLER_HIST_STRIDE") = FUSED_SAMPLER_HIST_STRIDE;
-    m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
-    m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
-    m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
 
-    m.def("cache_rotate", &cache_rotate, "cache_rotate");
     m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
-    m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
-
-    m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
-    m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
 
     m.def("quant_cache_cont", &quant_cache_cont, "quant_cache_cont");
     m.def("dequant_cache_cont", &dequant_cache_cont, "dequant_cache_cont");
@@ -223,4 +233,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/dsv4_compressor_bc.h"
     #include "libtorch/dsv4_attn_bc.h"
     #include "sam_bc.h"
+#endif
 }

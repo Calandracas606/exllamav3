@@ -2,6 +2,15 @@ from setuptools import setup
 import importlib.util
 import os
 
+# NOTE: When ROCm is installed in a Python venv (e.g. via TheRock pip index) rather
+# than system-wide at /opt/rocm, PyTorch's _find_rocm_home() may discover a stale
+# system ROCm installation and pass the wrong include/lib paths to the host compiler.
+# This causes "hip/hip_runtime.h: No such file" errors during the host C++ build step.
+#
+# Fix: set ROCM_HOME in the environment before building. The .env file in the repo
+# root does this; use:  uv run --env-file .env python setup.py develop
+# (The .env file is gitignored — it contains a machine-specific absolute path.)
+
 if torch := importlib.util.find_spec("torch") is not None:
     from torch.utils import cpp_extension
     from torch import version as torch_version
@@ -18,11 +27,17 @@ if precompile and not torch:
 windows = os.name == "nt"
 
 extra_cflags = []
-extra_cuda_cflags = [
-    "-lineinfo", "-O3", "--use_fast_math",
-    "-Xcudafe", "--diag_suppress=177",
-    "-Xcudafe", "--diag_suppress=20012",
-]
+extra_cuda_cflags = []
+
+if torch and torch_version.hip:
+    extra_cuda_cflags += ["-O3", "-DUSE_ROCM"]
+    extra_cflags += ["-DUSE_ROCM"]
+else:
+    extra_cuda_cflags += [
+        "-lineinfo", "-O3", "--use_fast_math",
+        "-Xcudafe", "--diag_suppress=177",
+        "-Xcudafe", "--diag_suppress=20012",
+    ]
 
 if windows:
     # NOMINMAX: windows.h otherwise defines min/max function-like macros that break every
@@ -47,6 +62,10 @@ if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
 
 if torch and torch_version.hip:
     extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
+    # ROCm 7.14 ships clang 22, which treats the deprecated `register` keyword as
+    # a hard error in C++17 mode (older ROCm toolchains only warned).
+    extra_cflags += ["-Wno-register"]
+    extra_cuda_cflags += ["-Wno-register"]
 
 extra_compile_args = {
     "cxx": extra_cflags,
@@ -55,12 +74,10 @@ extra_compile_args = {
 
 library_dir = "exllamav3"
 sources_dir = os.path.join(library_dir, extension_name)
-sources = [
-    os.path.relpath(os.path.join(root, file), start=os.path.dirname(__file__))
-    for root, _, files in os.walk(sources_dir)
-    for file in files
-    if file.endswith(('.c', '.cpp', '.cu'))
-]
+
+from exllamav3.exllamav3_ext.build_config import get_sources as _get_sources
+is_rocm = bool(torch and torch_version.hip)
+sources = _get_sources(sources_dir, is_rocm, base_dir=os.path.dirname(__file__))
 
 print (sources)
 
@@ -71,6 +88,7 @@ setup_kwargs = (
                 extension_name,
                 sources,
                 extra_compile_args=extra_compile_args,
+                include_dirs=[sources_dir],
                 libraries=["cublas"] if windows else [],
             )
         ],
