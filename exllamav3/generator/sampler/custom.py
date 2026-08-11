@@ -3,6 +3,7 @@ import math
 import os
 import torch
 from typing_extensions import override
+from ...util.platform import IS_ROCM
 from ...tokenizer import Tokenizer
 from ...ext import exllamav3_ext as ext
 from ...util import next_power_of_2
@@ -16,7 +17,8 @@ import torch.nn.functional as F
 
 # Collapse eligible sampler stacks into the fused kernel path; EXL3_FUSED_SAMPLER=0 keeps the
 # original step-by-step implementation (for testing/validation)
-fused_sampler_enable = os.environ.get("EXL3_FUSED_SAMPLER", "1") != "0"
+# Disabled on ROCm: sampling_fused.cu is excluded from the ROCm build.
+fused_sampler_enable = os.environ.get("EXL3_FUSED_SAMPLER", "1") != "0" and not IS_ROCM
 
 class SS(Enum):
     INIT = 0  # only state.in_logits is valid

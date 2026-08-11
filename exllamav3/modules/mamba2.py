@@ -10,6 +10,7 @@ from .gated_rmsnorm import GatedRMSNorm
 from .gated_delta_net import GDNLayerState
 from .gated_delta_net_fn import causal_conv1d_update
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
+from ..util.platform import IS_ROCM, has_ext
 
 try:
     from fla.ops.simple_gla import chunk_simple_gla
@@ -255,7 +256,8 @@ class Mamba2(Module):
             self.bc_padded_in = k_in != self.hidden_size
             self.bc_padded_out = n_out != self.hidden_size
 
-            self.bc = ext.BC_Mamba2(
+            if has_ext('BC_Mamba2'):
+                self.bc = ext.BC_Mamba2(
                 in_proj = self.in_proj.inner.bc,
                 o_proj = self.o_proj.inner.bc,
                 dt_bias = self.dt_bias_f,
@@ -275,6 +277,7 @@ class Mamba2(Module):
                 padded_out = self.bc_padded_out,
                 dt_first = self.tp_dt_first,
             )
+            else: self.bc = None
 
 
     @override

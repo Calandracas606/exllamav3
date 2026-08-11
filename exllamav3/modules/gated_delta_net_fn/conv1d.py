@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from ...util.tensor import get_for_device, buffered_arange
 from ...ext import exllamav3_ext as ext
+from ...util.platform import IS_ROCM, has_ext
 
 # Above this length the triton kernel splits into separate output/state kernels and its launch
 # overhead is amortized anyway; the CUDA kernel keeps the conv window in registers per thread
@@ -399,6 +400,7 @@ def causal_conv1d_update(
 
     if (
         mixed_qkv.is_cuda and
+        not IS_ROCM and
         seqlen <= MAX_CUDA_SEQLEN and
         conv1d_weight.shape[-1] <= MAX_CUDA_K and
         mixed_qkv.dtype == torch.bfloat16 and

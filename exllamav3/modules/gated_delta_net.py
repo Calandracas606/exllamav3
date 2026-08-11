@@ -20,6 +20,7 @@ from ..cache.recurrent import (
 )
 from ..util import profile_opt
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
+from ..util.platform import IS_ROCM, has_ext
 
 
 def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
@@ -562,7 +563,8 @@ class GatedDeltaNet(Module):
                 (device, (1, 1, self.num_v_heads * self.v_head_dim), torch.half),
             ]
 
-            self.bc = ext.BC_GatedDeltaNet(
+            if has_ext('BC_GatedDeltaNet'):
+                self.bc = ext.BC_GatedDeltaNet(
                 *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
                 self.qkvz_proj.inner.bc,
                 self.ba_proj.inner.bc,
@@ -578,6 +580,7 @@ class GatedDeltaNet(Module):
                 self.o_proj.inner.bc,
                 self.beta_scale
             )
+            else: self.bc = None
 
         # Fuse conv1d weights and cache the flattened weight (normally done lazily in forward,
         # needed here for the split-projection batched call)
@@ -620,7 +623,8 @@ class GatedDeltaNet(Module):
             self.ba_bias = torch.empty((2 * nv,), dtype = torch.half, device = device) if has_bias else None
             self.ba_weight_filled = False
 
-            self.bc = ext.BC_GatedDeltaNetSplit(
+            if has_ext('BC_GatedDeltaNetSplit'):
+                self.bc = ext.BC_GatedDeltaNetSplit(
                 self.qkv_proj.inner.bc,
                 self.z_proj.inner.bc,
                 self.o_proj.inner.bc,
@@ -637,7 +641,10 @@ class GatedDeltaNet(Module):
                 self.norm.bc,
                 self.beta_scale
             )
-            self.bc_split = True
+                self.bc_split = True
+            else:
+                self.bc = None
+                self.bc_split = False
 
 
     @override

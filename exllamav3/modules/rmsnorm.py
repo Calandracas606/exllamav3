@@ -5,6 +5,7 @@ from torch import nn
 from ..model.config import Config
 from . import Module
 from ..ext import exllamav3_ext as ext
+from ..util.platform import IS_ROCM
 from ..model.model_tp_alloc import TPAllocation
 
 class RMSNorm(Module):
@@ -104,6 +105,15 @@ class RMSNorm(Module):
         residual: torch.Tensor | None = None,
         residual_in: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # ROCm: route to PyTorch native. The C++ norm kernel is excluded from the ROCm build.
+        if IS_ROCM:
+            if residual_in is not None:
+                residual_in.add_(x)
+                return self.forward_torch(residual_in, params, out_dtype)
+            if residual is not None:
+                return self.forward_torch(residual, params, out_dtype)
+            return self.forward_torch(x, params, out_dtype)
+
         dtype = out_dtype or self.out_dtype
 
         # Fused pre-norm residual: residual_in += x (in place), y = norm(residual_in)

@@ -6,6 +6,7 @@ from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
 import os
 from ...util import profile_opt
+from ...util.platform import IS_ROCM, has_ext
 
 AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
@@ -77,21 +78,25 @@ class LinearEXL3:
         self.mul1 = self.mul1_tensor is not None
 
         self._fused_reconstruct = None
+
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
-        self.bc = ext.BC_LinearEXL3(
-            self.trellis,
-            self.suh,
-            self.svh,
-            self.K,
-            self.bias,
-            self.mcg,
-            self.mul1,
-            g_tensor_cache.get(*self.bsz1_xh_args)
-        )
+        # BC_LinearEXL3 is a CUDA-only fused path; on ROCm we always use reconstruct_hgemm
+        if has_ext('BC_LinearEXL3'):
+            self.bc = ext.BC_LinearEXL3(
+                self.trellis,
+                self.suh,
+                self.svh,
+                self.K,
+                self.bias,
+                self.mcg,
+                self.mul1,
+                g_tensor_cache.get(*self.bsz1_xh_args)
+            )
+        else:
+            self.bc = None
 
 
     def unload(self):
-        # g_tensor_cache.drop(*self.bsz1_xh_args)
         pass
 
 
@@ -128,6 +133,17 @@ class LinearEXL3:
         # responsible for contiguity (a silent copy here would hide a hot-path inefficiency
         # and break CUDA-graph address stability)
         assert x.is_contiguous(), f"LinearEXL3 {self.key}: non-contiguous input {tuple(x.shape)}"
+
+        # ROCm: tensor-core GEMM kernels are stubbed. Use on-the-fly reconstruct + hgemm.
+        #
+        # TODO(ROCm): This path dequantizes the full weight matrix on every forward call,
+        # making decode unusably slow for production. Caching the reconstructed fp16 weight
+        # would eliminate repeated dequant, but a typical 9B model at 3-4 bpw produces ~18 GB
+        # of fp16 weights — exceeding the 24 GB VRAM budget of a 7900 XTX. The long-term fix
+        # is a native ROCm WMMA-based EXL3 GEMM kernel (matching the CUDA tensor-core path).
+        # Until then, this is a functional correctness path only.
+        if IS_ROCM:
+            return self.reconstruct_hgemm(x, out_dtype)
 
         reconstruct = params.get("reconstruct")
         if not reconstruct:

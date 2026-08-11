@@ -34,6 +34,7 @@ def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
 
 from ..util.tensor import g_tensor_cache
 from .attention_fn import attn_dispatch
+from ..util.platform import IS_ROCM, has_ext
 
 """
                    
@@ -431,6 +432,7 @@ class Attention(Module):
         if (
             not self.config.infer_params.no_reconstruct and
             not self.use_k_as_v and
+            not IS_ROCM and
             device != torch.device("cpu") and
             self.k_proj.quant_type == "exl3" and
             self.v_proj is not None and
@@ -454,6 +456,7 @@ class Attention(Module):
         if (
             not self.config.infer_params.no_reconstruct and
             self.g_proj is not None and
+            not IS_ROCM and
             device != torch.device("cpu") and
             self.q_proj.quant_type == "exl3" and
             self.g_proj.quant_type == "exl3" and
@@ -555,7 +558,7 @@ class Attention(Module):
         if self.multi_qg is None or bsz * q_len > 32:
             q = self.q_proj.forward(x, params)
             if self.interleaved_gate:
-                if self.head_dim % 8 == 0 and q.dtype == torch.half:
+                if not IS_ROCM and self.head_dim % 8 == 0 and q.dtype == torch.half:
                     qg = q
                     q = torch.empty((bsz, q_len, self.num_q_heads, self.head_dim), dtype = torch.half, device = qg.device)
                     g = torch.empty((bsz, q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = qg.device)
@@ -779,10 +782,15 @@ class Attention(Module):
         )
 
         if self.headwise_gate:
-            if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
+            if IS_ROCM:
+                if self.gate_softplus: o.mul_(torch.nn.functional.softplus(g.float(), threshold=11).to(o.dtype))
+                else: o.mul_(torch.sigmoid(g))
+            elif self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
             else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        if self.full_gate or self.interleaved_gate:
+            if IS_ROCM: o.mul_(torch.sigmoid(g))
+            else: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -903,10 +911,15 @@ class Attention(Module):
         )
 
         if self.headwise_gate:
-            if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
+            if IS_ROCM:
+                if self.gate_softplus: o.mul_(torch.nn.functional.softplus(g.float(), threshold=11).to(o.dtype))
+                else: o.mul_(torch.sigmoid(g))
+            elif self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
             else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        if self.full_gate or self.interleaved_gate:
+            if IS_ROCM: o.mul_(torch.sigmoid(g))
+            else: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o

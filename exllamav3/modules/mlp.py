@@ -11,6 +11,7 @@ from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
 from ..util.tensor import g_tensor_cache
+from ..util.platform import IS_ROCM, has_ext
 
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
 
@@ -214,7 +215,8 @@ class MLP(Module):
             if down0.out_features != self.out_size:
                 yp = g_tensor_cache.get(device, (1, down0.out_features), self.out_dtype or torch.half, "mlp_yp")
 
-            self.bc = ext.BC_MLP(
+            if has_ext('BC_MLP'):
+                self.bc = ext.BC_MLP(
                 xp = xp,
                 u = u,
                 ones = ones,
@@ -228,6 +230,7 @@ class MLP(Module):
                 hidden_size = self.hidden_size,
                 out_size = self.out_size,
             )
+            else: self.bc = None
 
 
     @override
@@ -268,7 +271,8 @@ class MLP(Module):
         # the third invocation on
         bsz, q_len, _ = x.shape
         if (
-            self.bc is not None and bsz == 1 and q_len == 1 and
+            self.bc is not None and
+            bsz == 1 and q_len == 1 and
             x.dtype == torch.float16 and x.is_contiguous()
         ):
             d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
@@ -585,10 +589,25 @@ class GatedMLP(Module):
 
                 a = b
 
-        match activation_fn:
-            case "silu": self.activation_fn_call = ext.silu_mul
-            case "relu2": self.activation_fn_call = ext.relu2_mul
-            case "gelu": self.activation_fn_call = ext.gelu_mul
+        if IS_ROCM:
+            # ROCm: use PyTorch-native gated activation (z = act(x) * y with optional softcap).
+            # The C++ activation kernels are excluded from the ROCm build.
+            def _torch_act_mul(act_fn):
+                def fn(x, y, z, act_limit):
+                    result = act_fn(x) * y
+                    if act_limit != 0.0:
+                        result = torch.clamp(result, min = -act_limit, max = act_limit)
+                    z.copy_(result)
+                return fn
+            match activation_fn:
+                case "silu": self.activation_fn_call = _torch_act_mul(F.silu)
+                case "relu2": self.activation_fn_call = _torch_act_mul(lambda x: torch.square(F.relu(x)))
+                case "gelu": self.activation_fn_call = _torch_act_mul(lambda x: F.gelu(x, approximate = "tanh"))
+        else:
+            match activation_fn:
+                case "silu": self.activation_fn_call = ext.silu_mul
+                case "relu2": self.activation_fn_call = ext.relu2_mul
+                case "gelu": self.activation_fn_call = ext.gelu_mul
 
         self.tp_reduce = False
         self.multi_gu: list[MultiLinear | None] = [None] * self.num_slices
@@ -628,6 +647,7 @@ class GatedMLP(Module):
         # Test if gate and up proj can be fused
         if (
             not self.config.infer_params.no_reconstruct and
+            not IS_ROCM and
             device != torch.device("cpu") and
             self.gates[load_slice].quant_type == "exl3" and
             self.ups[load_slice].quant_type == "exl3" and
@@ -664,7 +684,8 @@ class GatedMLP(Module):
                     (device, (1, MAX_BSZN, out_f), torch.half, "a2"),
                     (device, (1, MAX_BSZN, out_f), torch.half, "down_xh"),
                 ]
-                self.bc = ext.BC_GatedMLP(
+                if has_ext('BC_GatedMLP'):
+                    self.bc = ext.BC_GatedMLP(
                     *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
                     mgu.ptrs_trellis if mgu is not None else None,
                     mgu.ptrs_suh if mgu is not None else None,
@@ -680,6 +701,8 @@ class GatedMLP(Module):
                     self.downs[0].inner.bc,
                     self.act_limit,
                 )
+                else:
+                    self.bc = None
 
 
     @override

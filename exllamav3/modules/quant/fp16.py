@@ -4,6 +4,7 @@ from torch import nn
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import to2
 from ...util import first_not_none
+from ...util.platform import IS_ROCM, has_ext
 
 class LinearFP16:
 
@@ -50,10 +51,12 @@ class LinearFP16:
             w.copy_(self.weight)
             self.weight = w
 
-        self.bc = ext.BC_LinearFP16(
+        if has_ext('BC_LinearFP16'):
+            self.bc = ext.BC_LinearFP16(
             self.weight,
             self.bias,
         )
+        else: self.bc = None
 
     def unload(self):
         pass

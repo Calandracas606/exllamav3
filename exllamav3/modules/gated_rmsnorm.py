@@ -7,6 +7,7 @@ from ..model.config import Config
 from . import Module
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
+from ..util.platform import IS_ROCM, has_ext
 
 class GatedRMSNorm(Module):
 
@@ -53,7 +54,7 @@ class GatedRMSNorm(Module):
             self.constant_bias,
             self.groups,
             self.gate_first,
-        )
+        ) if has_ext('BC_GatedRMSNorm') else None
 
     @override
     def unload(self):
@@ -121,6 +122,10 @@ class GatedRMSNorm(Module):
         out_dtype: torch.dtype | None = None,
         gate: torch.Tensor = None,
     ) -> torch.Tensor:
+        # ROCm: route to PyTorch native. The C++ norm kernel is excluded from the ROCm build.
+        if IS_ROCM:
+            return self.forward_torch(x, params, out_dtype, gate)
+
         y = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
         ext.gated_rms_norm(x, self.weight, y, gate, self.rms_norm_eps, self.constant_bias, self.groups, self.gate_first)
         return y
@@ -165,8 +170,11 @@ class GatedRMSNorm(Module):
         module.weight = nn.Parameter(w)
         # load() builds the BC alongside the weight; the TP import must too, or graphed consumers
         # (BC_GatedDeltaNetSplit holds norm.bc) get a null pointer
-        module.bc = ext.BC_GatedRMSNorm(module.weight, module.rms_norm_eps, module.constant_bias,
+        if has_ext('BC_GatedRMSNorm'):
+            module.bc = ext.BC_GatedRMSNorm(module.weight, module.rms_norm_eps, module.constant_bias,
                                         module.groups, module.gate_first)
+        else:
+            module.bc = None
         torch.cuda.synchronize()
         return module
 
@@ -189,7 +197,10 @@ class GatedRMSNorm(Module):
             # module.groups to the local group count
             w = w[first : last]
         module.weight = nn.Parameter(w.to(module.device).contiguous())
-        module.bc = ext.BC_GatedRMSNorm(module.weight, module.rms_norm_eps, module.constant_bias,
+        if has_ext('BC_GatedRMSNorm'):
+            module.bc = ext.BC_GatedRMSNorm(module.weight, module.rms_norm_eps, module.constant_bias,
                                         module.groups, module.gate_first)
+        else:
+            module.bc = None
 
         return module

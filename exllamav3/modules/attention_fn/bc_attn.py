@@ -5,6 +5,7 @@ import torch
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
+from ...util.platform import IS_ROCM, has_ext
 
 """
 Graph-captured decode attention (BC_Attention): the whole attention block for a decode step --
@@ -165,7 +166,8 @@ class BCAttn:
         elif self.gate_mode == 2 and mqg is None and not self._has_bc(module.g_proj):
             self.g_weight = self._fp16_gate_weight(module.g_proj)
 
-        self.bc = ext.BC_Attention(
+        if has_ext('BC_Attention'):
+            self.bc = ext.BC_Attention(
             num_q_heads = self.num_q_heads,
             num_kv_heads = self.num_kv_heads,
             head_dim = self.head_dim,
@@ -219,6 +221,7 @@ class BCAttn:
             h32 = h32,
             sinks = self.sinks,
         )
+        else: self.bc = None
         self.slot_widths = {}
 
     def _configure(self, bsz: int, q_len: int, causal: bool):
@@ -367,6 +370,7 @@ def _module_eligible(m):
     """Module-level requirements shared by the global-attention and SWA builders."""
     return (
         bc_attn_enable and
+        not IS_ROCM and
         # NoPE is supported (the rope stage is skipped), but the head norms run inside the rope
         # kernel, so a norm-only module without rope has nowhere to apply them
         (m.rope is not None or m.q_norm is None) and

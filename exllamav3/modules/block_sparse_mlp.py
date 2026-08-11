@@ -14,6 +14,7 @@ from .layernorm import LayerNorm
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
+from ..util.platform import IS_ROCM, has_ext
 
 TEMP_ROWS_FUSED = 128
 TEMP_ROWS_GRAPH = 32
@@ -914,7 +915,8 @@ class BlockSparseMLP(Module):
             # Bound class for graph, dq and fused-bsz1 paths (gateless: the up module stands in
             # for the unused gate pointer args, and the gates list is empty)
             multi_gate = self.multi_gate if self.gated else self.multi_up
-            self.bc = ext.BC_BlockSparseMLP(
+            if has_ext('BC_BlockSparseMLP'):
+                self.bc = ext.BC_BlockSparseMLP(
                 yh2,
                 cfg.yh,
                 interm_gu,
@@ -968,6 +970,7 @@ class BlockSparseMLP(Module):
                 cfg.out_trim,
                 act_relu2 = self.activation_fn == "relu2",
             )
+            else: self.bc = None
 
             # Larger buffers for fused path, if supported
             if self.support_fused:
