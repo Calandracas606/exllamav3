@@ -1,6 +1,7 @@
 #pragma once
 
 #include "codebook.cuh"
+#include "../compat.cuh"
 
 __device__ __forceinline__ uint32_t fshift(const uint32_t b, const uint32_t a, int shift)
 {

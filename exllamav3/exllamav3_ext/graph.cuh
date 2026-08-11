@@ -111,10 +111,17 @@ public:
     std::vector<std::tuple<int, int, int, int>> graph_node_sites;
 
     std::vector<cudaGraphNode_t> nodes;
+#if defined(USE_ROCM)
+    std::vector<hipKernelNodeParams> node_params;
+#else
     std::vector<cudaKernelNodeParams> node_params;
+#endif
     // Kernel nodes captured from driver-API launches (Triton cubins) cannot be read through the
-    // runtime API ("invalid device function"); their params live here instead
+    // runtime API ("invalid device function"); their params live here instead.
+    // CUDA only: HIP's unified API has no runtime/driver split, so this fallback isn't needed.
+#if !defined(USE_ROCM)
     std::vector<CUDA_KERNEL_NODE_PARAMS> node_params_drv;
+#endif
     std::vector<char> node_is_driver;
     std::vector<void*> current_values;
     std::vector<bool> node_needs_update;

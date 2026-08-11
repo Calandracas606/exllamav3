@@ -1,23 +1,40 @@
 #pragma once
 
 #include <cstdio>
+#if defined(USE_ROCM)
+#include <hip/hip_fp16.h>
+#if defined(__HIPCC__)
+#include <hip/hip_bf16.h>
+#define EXL_HAVE_BF16 1
+#else
+#define EXL_HAVE_BF16 0
+#endif
+#include "compat.cuh"
+#else
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#define EXL_HAVE_BF16 1
+#endif
 #include <cublas_v2.h>
 
-typedef struct __align__(8) half4
+// Warp shuffle mask translation is handled by macros in compat_rocm.cuh,
+// so source code uses CUDA-style __shfl_*_sync(0xffffffff, ...) unchanged.
+
+struct __attribute__((aligned(8))) half4
 {
     half2 x;
     half2 y;
     __device__ half4() = default;
     __device__ half4(half2 x_, half2 y_) : x(x_), y(y_) {}
+#if !defined(USE_ROCM) || defined(__HIPCC__)
     __device__ half4(half h0, half h1, half h2, half h3) :
          x(__halves2half2(h0, h1)),
          y(__halves2half2(h2, h3)) {}
-}
-half4;
+#endif
+};
 
-typedef struct __align__(8) bfloat164
+#if EXL_HAVE_BF16
+struct __attribute__((aligned(8))) bfloat164
 {
     __nv_bfloat162 x;
     __nv_bfloat162 y;
@@ -26,10 +43,10 @@ typedef struct __align__(8) bfloat164
     __device__ bfloat164(__nv_bfloat16 b0, __nv_bfloat16 b1, __nv_bfloat16 b2, __nv_bfloat16 b3) :
         x(__halves2bfloat162(b0, b1)),
         y(__halves2bfloat162(b2, b3)) {}
-}
-bfloat164;
+};
+#endif
 
-typedef struct __align__(16) half8
+struct __attribute__((aligned(16))) half8
 {
     half2 x;
     half2 y;
@@ -37,13 +54,14 @@ typedef struct __align__(16) half8
     half2 w;
      __device__ half8() = default;
      __device__ half8(half2 x_, half2 y_, half2 z_, half2 w_) : x(x_), y(y_), z(z_), w(w_) {}
+#if !defined(USE_ROCM) || defined(__HIPCC__)
      __device__ half8(half h0, half h1, half h2, half h3, half h4, half h5, half h6, half h7) :
          x(__halves2half2(h0, h1)),
          y(__halves2half2(h2, h3)),
          z(__halves2half2(h4, h5)),
          w(__halves2half2(h6, h7)) {}
-}
-half8;
+#endif
+};
 
 struct Dim3
 {
@@ -110,7 +128,9 @@ inline const char* cublasGetErrorString(cublasStatus_t status) {
         case CUBLAS_STATUS_EXECUTION_FAILED:  return "CUBLAS_STATUS_EXECUTION_FAILED";
         case CUBLAS_STATUS_INTERNAL_ERROR:    return "CUBLAS_STATUS_INTERNAL_ERROR";
         case CUBLAS_STATUS_NOT_SUPPORTED:     return "CUBLAS_STATUS_NOT_SUPPORTED";
+#if !defined(USE_ROCM)
         case CUBLAS_STATUS_LICENSE_ERROR:     return "CUBLAS_STATUS_LICENSE_ERROR";
+#endif
         default:                              return "Unknown cuBLAS status";
     }
 }
