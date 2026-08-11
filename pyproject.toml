@@ -1,0 +1,74 @@
+[project]
+name = "exllamav3"
+version = "0.1.0"
+description = "High-performance LLM inference engine"
+requires-python = ">=3.11,<3.13"
+dependencies = []
+
+[project.optional-dependencies]
+# The full ROCm / HIP stack is delivered as Python wheels from AMD's TheRock
+# multi-arch index (https://repo.amd.com/rocm/whl-multi-arch/). This includes the
+# ROCm core SDK, libraries, compilers (hipcc), and pre-compiled gfx1100 kernels, so
+# NO system-wide ROCm installation is required — everything lives in the venv.
+#
+# All ROCm-specific packages are declared as direct deps (not just transitive deps
+# of torch) because an `explicit = true` index only applies to direct deps. Each is
+# sourced to the amd-rocm index in [tool.uv.sources]. Version bounds are open (`>=`)
+# — the checked-in uv.lock pins the exact resolved versions.
+rocm = [
+    "torch[device-gfx1100]>=2.10",
+    "triton",
+    "rocm[libraries,devel,device-gfx1100]>=7.14",
+    # Transitive deps of torch/rocm that only exist on the AMD index — declared
+    # directly so the explicit source mapping is honored.
+    "rocm-bootstrap",
+    "amd-torch-device-gfx1100",
+    "amd-torch-device-gfx11",
+    "rocm-sdk-core>=7.14",
+    "rocm-sdk-libraries>=7.14",
+    "rocm-sdk-devel>=7.14",
+    "rocm-sdk-device-gfx1100>=7.14",
+    # Pure-Python deps from PyPI
+    "tokenizers>=0.21.1",
+    "numpy>=2.1.0",
+    "rich",
+    "typing_extensions",
+    "safetensors>=0.3.2",
+    "ninja",
+    "pillow",
+    "pyyaml",
+    "marisa_trie",
+    "kbnf>=0.4.2",
+    "pydantic",
+    "formatron>=0.5.0",
+    "flash-linear-attention>=0.5.0",
+]
+dev = [
+    "pytest>=8",
+    "hf_transfer",
+]
+
+# AMD ROCm wheels are published to a separate index from PyPI. The index is marked
+# explicit so only the ROCm-specific packages sourced in [tool.uv.sources] are
+# pulled from it; all other dependencies resolve from PyPI.
+[[tool.uv.index]]
+name = "amd-rocm"
+url = "https://repo.amd.com/rocm/whl-multi-arch/"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "amd-rocm" }
+triton = { index = "amd-rocm" }
+rocm = { index = "amd-rocm" }
+rocm-bootstrap = { index = "amd-rocm" }
+rocm-sdk-core = { index = "amd-rocm" }
+rocm-sdk-libraries = { index = "amd-rocm" }
+rocm-sdk-devel = { index = "amd-rocm" }
+rocm-sdk-device-gfx1100 = { index = "amd-rocm" }
+amd-torch-device-gfx1100 = { index = "amd-rocm" }
+amd-torch-device-gfx11 = { index = "amd-rocm" }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

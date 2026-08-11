@@ -9,3 +9,16 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
+
+# uv / venv
+.venv/
+.env
+
+# PyTorch hipify generated files (regenerated at build time)
+exllamav3/exllamav3_ext/**/*.hip
+exllamav3/exllamav3_ext/**/*_hip.cuh
+exllamav3/exllamav3_ext/**/*_hip.cpp
+exllamav3/exllamav3_ext/**/*_hip.h
+exllamav3/exllamav3_ext/**/hip_drv.*
+exllamav3/exllamav3_ext/**/*.o
+exllamav3/exllamav3_ext/**/*.o.tmp
