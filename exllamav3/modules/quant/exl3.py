@@ -6,6 +6,7 @@ from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
 import os
 from ...util import profile_opt
+from ...exl3_gemm_op import exl3_gemm as exl3_gemm_op
 
 AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
@@ -136,6 +137,14 @@ class LinearEXL3:
                 if self.bc is not None:
                     dtype = out_dtype or self.default_out_dtype
                     return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
+
+        # Use the custom op when the BC kernel is unavailable (e.g. ROCm)
+        if self.bc is None:
+            return exl3_gemm_op(
+                x, self.trellis, self.suh, self.svh, self.K,
+                self.mcg, self.mul1, self.in_features, self.out_features,
+                self.trellis.device, out_dtype or self.default_out_dtype,
+            )
 
         return self.reconstruct_hgemm(x, out_dtype)
 
