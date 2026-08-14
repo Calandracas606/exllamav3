@@ -173,12 +173,19 @@ if torch.version.hip:
 
     _bc_none = _BCNone()
 
-    # BC_* constructors: return None when the class isn't compiled
+    # BC_* constructors: use the real Python graph-capturing implementations for
+    # the linear classes (defined in bc_rocm.py) when the C++ version isn't
+    # compiled in; return None for the rest that have no Python equivalent.
+    from .bc_rocm import BC_LinearEXL3, BC_LinearFP16
+    if not hasattr(exllamav3_ext, 'BC_LinearEXL3'):
+        exllamav3_ext.BC_LinearEXL3 = BC_LinearEXL3
+    if not hasattr(exllamav3_ext, 'BC_LinearFP16'):
+        exllamav3_ext.BC_LinearFP16 = BC_LinearFP16
+
     for _name in [
         'BC_Mamba2', 'BC_GatedDeltaNet', 'BC_GatedDeltaNetSplit',
         'BC_MLP', 'BC_GatedMLP', 'BC_BlockSparseMLP',
         'BC_Attention', 'BC_GatedRMSNorm',
-        'BC_LinearEXL3', 'BC_LinearFP16',
         'BC_DSV4Compressor', 'BC_DSV4Attention', 'BC_DSV4BatchAttention',
         'BC_MLAttention', 'BC_SAM',
     ]:
@@ -205,3 +212,10 @@ if torch.version.hip:
     if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE'):
         setattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE', 0)
     os.environ.setdefault('EXL3_FUSED_SAMPLER', '0')
+
+    # The graph-captured BC attention block (bc_attn.py) depends on ext.BC_Attention and
+    # ext.TritonKernel, neither of which is compiled on ROCm. Now that BC_LinearEXL3 is a
+    # real (non-None) object, the attention gating in _module_eligible would otherwise turn
+    # the path on and crash in _compile_kernel. Disable it here so attention falls back to
+    # the regular dispatch path, while the EXL3 linear layers still benefit from graph capture.
+    os.environ.setdefault('EXL3_BC_ATTN', '0')

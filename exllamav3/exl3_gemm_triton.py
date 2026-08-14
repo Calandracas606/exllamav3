@@ -1,15 +1,17 @@
-"""Triton matmul operator for EXL3 linear layers.
+"""Triton operators for EXL3 linear layers.
 
-This module provides a fused dequant+GEMM pipeline composed of three ops:
+The ops live in the ``exl3_ops::`` namespace:
 
-    1. torch.ops.exl3_ops.had_r_128(x, xh, suh)       # C++ custom op
-    2. dequant_trellis + triton matmul                   # pure-PyTorch dequant + GEMM
-    3. torch.ops.exl3_ops.had_r_128(y, y, svh)          # C++ custom op
+    exl3_ops::had_r_128_triton(x, y, suh)          # Triton: row Hadamard transform
+    exl3_ops::exl3_gemm_triton(xh, t, y, ...)      # Triton: fused dequant + GEMM
+    exl3_ops::LinearEXL3_triton(x, y, xh, ...)     # composition of the two, below
 
-The Triton matmul (``exl3::exl3_gemm_triton``) is registered via
-``torch.library.triton_op`` and does ONLY the matmul (x @ w -> y).
-The dequantization is done in pure PyTorch (no C++ ext.reconstruct call)
-using a precomputed decode LUT and bitstream window extraction.
+``LinearEXL3_triton`` is the complete EXL3 linear forward —
+hadamard -> fused-dequant-gemm -> hadamard (+ optional bias) — writing into
+caller-provided buffers so it composes with CUDA graph capture (see bc_rocm.py).
+It depends only on Triton: every kernel it launches is a Triton kernel.
+Callers outside this pipeline use the C++ kernel via the pybind
+``ext.had_r_128`` (quant/hadamard.cu).
 """
 from __future__ import annotations
 
@@ -17,7 +19,179 @@ import torch
 import triton
 import triton.language as tl
 
-from .ext import exllamav3_ext as ext
+# ---------------------------------------------------------------------------
+# Triton Hadamard transform (128-element rows, radix-2 butterfly)
+#
+# Mirrors the C++ had_hf/had_ff_r_128 kernels exactly: the transform is
+# evaluated in fp32 regardless of I/O dtype (with a single round to half at
+# the very end for half output), r_scale = scale / sqrt(128) is applied in
+# fp32 after the transform, and pre/post scales are applied in the I/O
+# dtype. The butterfly runs sequentially over masks 1..64, which reproduces
+# the C++ expression tree (4-point transform in registers, then 32-lane
+# xor-shuffles) term-for-term, so results are bit-identical.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _had_stage(v, BLOCK_R: tl.constexpr, SPAN: tl.constexpr):
+    """One radix-2 butterfly stage over a [BLOCK_R, 128] fp32 tile.
+
+    Elements whose bit log2(SPAN) is 0 receive a+b, those with the bit set
+    receive a-b, where b is the partner element at distance SPAN.
+    """
+    G: tl.constexpr = 128 // (2 * SPAN)
+    pair = tl.permute(v.reshape(BLOCK_R, G, 2, SPAN), (0, 1, 3, 2))
+    lo, hi = tl.split(pair)
+    pair = tl.join(lo + hi, lo - hi)
+    return tl.permute(pair, (0, 1, 3, 2)).reshape(BLOCK_R, 128)
+
+
+@triton.jit
+def _had_r_128_kernel(
+    x_ptr, y_ptr, scale_ptr,
+    n_rows,
+    stride_xr, stride_yr,
+    r_scale,
+    IO_FP32: tl.constexpr,
+    PRE_SCALED: tl.constexpr,
+    POST_SCALED: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    # One program transforms a [BLOCK_R, 128] tile: pid_m rows, pid_c the
+    # 128-column block within each row. Scales are indexed by flat column
+    # position (row-independent), matching the C++ kernel.
+    pid_m = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    rows = pid_m * BLOCK_R + tl.arange(0, BLOCK_R)
+    mask_r = rows < n_rows
+    col = tl.arange(0, 128)
+
+    x = tl.load(
+        x_ptr + rows[:, None] * stride_xr + (pid_c * 128 + col)[None, :],
+        mask=mask_r[:, None], other=0.0,
+    )
+
+    # Pre-scale, applied in the I/O dtype (half multiply for the half path,
+    # exactly like the C++ __hmul2 version)
+    if PRE_SCALED:
+        pre = tl.load(scale_ptr + pid_c * 128 + col)
+        if IO_FP32:
+            x = x * pre.to(tl.float32)
+        else:
+            x = x * pre
+
+    # fp32 radix-2 butterfly over bit masks 1..64, unrolled via a constexpr
+    # helper. Each stage pairs element j with j^span: the bit-0 element gets
+    # a+b, the bit-1 element a-b — the same expression tree as the C++
+    # register H4 + xor-shuffle network, so the result is bit-identical.
+    v = x.to(tl.float32)
+    v = _had_stage(v, BLOCK_R, 1)
+    v = _had_stage(v, BLOCK_R, 2)
+    v = _had_stage(v, BLOCK_R, 4)
+    v = _had_stage(v, BLOCK_R, 8)
+    v = _had_stage(v, BLOCK_R, 16)
+    v = _had_stage(v, BLOCK_R, 32)
+    v = _had_stage(v, BLOCK_R, 64)
+    v = v * r_scale
+
+    # Post-scale. The C++ half kernel rounds the scaled transform to half
+    # first and then multiplies in half; reproduce that ordering exactly.
+    if POST_SCALED:
+        post = tl.load(scale_ptr + pid_c * 128 + col)
+        if IO_FP32:
+            out = v * post.to(tl.float32)
+        else:
+            out = v.to(x_ptr.dtype.element_ty) * post
+    else:
+        out = v
+
+    tl.store(
+        y_ptr + rows[:, None] * stride_yr + (pid_c * 128 + col)[None, :],
+        out.to(y_ptr.dtype.element_ty),
+        mask=mask_r[:, None],
+    )
+
+# ---------------------------------------------------------------------------
+# had_r_128_triton: Triton row Hadamard transform
+#
+# A Triton twin of the C++ pybind ``ext.had_r_128`` (quant/hadamard.cu),
+# bit-identical by construction. Used ONLY inside LinearEXL3_triton so that
+# the whole EXL3 linear path depends on Triton alone; every other caller
+# keeps using the C++ kernel through pybind.
+#
+# Scope note: its kernel time matches or beats the C++ kernel at every shape
+# (measured via CUDA-graph replay), but an EAGER call from Python pays the
+# torch.ops dispatch + Triton launch path — roughly 2-3x the pybind call's
+# cost. It exists for the graph-captured path, where launch overhead does not
+# apply; don't adopt it on uncaptured hot paths.
+# ---------------------------------------------------------------------------
+
+_RSCALE_128 = 0.088388347648  # 1/sqrt(128), matches the C++ literal
+
+_LIB = torch.library.Library("exl3_ops", "FRAGMENT")
+_LIB.define(
+    "had_r_128_triton("
+    "Tensor input, Tensor(a!) output, Tensor? pre_scale, "
+    "Tensor? post_scale, float scale"
+    ") -> ()"
+)
+
+
+@torch.library.register_fake("exl3_ops::had_r_128_triton")
+def _had_r_128_triton_fake(input, output, pre_scale, post_scale, scale):
+    # output is mutated in-place; no new tensors are returned
+    return
+
+
+@torch.library.impl("exl3_ops::had_r_128_triton", "default")
+def _had_r_128_triton_impl(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    pre_scale: torch.Tensor | None,
+    post_scale: torch.Tensor | None,
+    scale: float,
+) -> None:
+    """y = (x.view(-1, 128) @ H128) * (pre|post)_scale, scaled by scale/sqrt(128).
+
+    Matches the C++ ``had_r_128`` contract: input/output must be 2D, the same
+    dtype (half or float), contiguous in the last dim, with last dim a
+    multiple of 128; scales are half tensors with one element per column
+    (flat, row-independent). Pre-scale multiplies before the transform in the
+    I/O dtype; post-scale multiplies after it (for half output, after the
+    round to half), like the C++ kernels.
+    """
+    assert input.dtype == output.dtype, "had_r_128_triton: input/output dtype mismatch"
+    assert input.dtype in (torch.half, torch.float), \
+        f"had_r_128_triton: unsupported dtype {input.dtype}"
+    assert input.dim() == 2 and input.shape[-1] % 128 == 0
+    # The kernel indexes the last dim with an implicit unit stride
+    assert input.stride(-1) == 1, \
+        f"had_r_128_triton: input last dim must be contiguous, got stride {input.stride(-1)}"
+    assert output.stride(-1) == 1, \
+        f"had_r_128_triton: output last dim must be contiguous, got stride {output.stride(-1)}"
+    assert (pre_scale is None) or (post_scale is None)
+    rows, cols = input.shape
+
+    # Tiling (swept on RDNA3 via graph-of-64 replay timing): BLOCK_R=4 with a
+    # single warp is optimal or tied-for-optimal at every shape from rows==1
+    # (decode) through rows==512+ (prefill). The 128-wide tile leaves extra
+    # warps idle; wider row tiles only help shapes too small to matter.
+    BLOCK_R = 4
+    num_warps = 1
+
+    grid = (triton.cdiv(rows, BLOCK_R), cols // 128)
+    _had_r_128_kernel[grid](
+        input, output,
+        pre_scale if pre_scale is not None else post_scale,
+        rows,
+        input.stride(0), output.stride(0),
+        scale * _RSCALE_128,
+        IO_FP32=input.dtype == torch.float,
+        PRE_SCALED=pre_scale is not None,
+        POST_SCALED=post_scale is not None,
+        BLOCK_R=BLOCK_R,
+        num_warps=num_warps,
+    )
+
 
 # ---------------------------------------------------------------------------
 # EXL3 dequantization in pure PyTorch
@@ -396,7 +570,7 @@ def _fused_dequant_gemm_kernel(
 _wrapped_fused_kernel = torch.library.wrap_triton(_fused_dequant_gemm_kernel)
 
 
-@torch.library.triton_op("exl3::exl3_gemm_triton", mutates_args=("y",))
+@torch.library.triton_op("exl3_ops::exl3_gemm_triton", mutates_args=("y",))
 def exl3_gemm_triton(
     x: torch.Tensor,
     trellis: torch.Tensor,
@@ -430,8 +604,69 @@ def exl3_gemm_triton(
 
 
 # ---------------------------------------------------------------------------
-# Fused dequant + GEMM
+# LinearEXL3 composition op: had_r_128_triton -> gemm -> had_r_128_triton
 # ---------------------------------------------------------------------------
+
+_LIB.define(
+    "LinearEXL3_triton("
+    "Tensor x, Tensor(a!) y, Tensor(b!) xh, "
+    "Tensor trellis, Tensor suh, Tensor svh, "
+    "int K, bool mcg, bool mul1, Tensor? bias, "
+    "int in_features, int out_features"
+    ") -> ()"
+)
+
+
+@torch.library.register_fake("exl3_ops::LinearEXL3_triton")
+def _linear_exl3_triton_fake(
+    x, y, xh, trellis, suh, svh, K, mcg, mul1, bias, in_features, out_features
+):
+    # y and xh are mutated in-place; no new tensors are returned
+    return
+
+
+@torch.library.impl("exl3_ops::LinearEXL3_triton", "default")
+def _linear_exl3_triton_impl(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    xh: torch.Tensor,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    K: int,
+    mcg: bool,
+    mul1: bool,
+    bias: torch.Tensor | None,
+    in_features: int,
+    out_features: int,
+) -> None:
+    """Complete EXL3 linear forward into pre-allocated buffers.
+
+    Writes the Hadamard-transformed input to ``xh`` and the result to ``y``.
+    All tensors must be pre-allocated with stable addresses for CUDA graph
+    capture; nothing is allocated inside this op.
+    """
+    # A cast here would allocate and silently break a capturing graph; callers
+    # that need dtype conversion must cast before invoking the op.
+    assert x.dtype == torch.half, f"LinearEXL3_triton: expected half input, got {x.dtype}"
+
+    # Phase 1: input Hadamard transform -> xh
+    torch.ops.exl3_ops.had_r_128_triton(x, xh, suh, None, 1.0)
+
+    # Phase 2 + 3: fused dequant + Triton GEMM -> y
+    cb = 1 if mcg else (2 if mul1 else 0)
+    torch.ops.exl3_ops.exl3_gemm_triton(
+        xh, trellis, y,
+        _decode_lut(cb, x.device), _get_perm(x.device),
+        K, trellis.shape[1], cb,
+    )
+
+    # Phase 4: output Hadamard transform (in place)
+    torch.ops.exl3_ops.had_r_128_triton(y, y, None, svh, 1.0)
+
+    if bias is not None:
+        y.add_(bias)
+
 
 def exl3_gemm(
     x: torch.Tensor,
@@ -445,10 +680,18 @@ def exl3_gemm(
     out_features: int,
     device: torch.device,
     out_dtype: torch.dtype = torch.half,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Fused EXL3 dequant + GEMM. Does NOT materialize the weight matrix.
+    """Fused EXL3 dequant + GEMM, allocating and returning the output.
 
-    Dequantization happens tile-by-tile inside the Triton kernel.
+    Thin convenience wrapper over ``exl3_ops::LinearEXL3_triton``. The BC
+    (graph-capture) path calls the op directly to keep tensor addresses
+    stable across replays.
+
+    The per-call ``xh`` workspace allocation is deliberate and cheap: the
+    caching allocator serves it from its free list (no cudaMalloc, no sync)
+    after the first few calls, and this wrapper is off the decode hot path —
+    prefill is dominated by the GEMM itself.
     """
     original_shape = x.shape
     x_flat = x.view(-1, in_features)
@@ -456,20 +699,12 @@ def exl3_gemm(
 
     x_half = x_flat if x_flat.dtype == torch.half else x_flat.to(torch.half)
 
-    # Phase 1: Hadamard-transform input
-    xh = torch.empty_like(x_half)
-    torch.ops.exl3_ops.had_r_128(x_half, xh, suh, None, 1.0)
-
-    # Phase 2+3: Fused dequant + Triton matmul (no weight matrix materialization)
-    cb = 1 if mcg else (2 if mul1 else 0)
-    lut = _decode_lut(cb, device)
-    perm_i = _get_perm(device)
-    tiles_n = trellis.shape[1]
-
     y = torch.empty((rows, out_features), dtype=out_dtype, device=device)
-    torch.ops.exl3.exl3_gemm_triton(xh, trellis, y, lut, perm_i, K, tiles_n, cb)
+    xh = torch.empty_like(x_half)
 
-    # Phase 4: Hadamard-transform output
-    torch.ops.exl3_ops.had_r_128(y, y, None, svh, 1.0)
+    torch.ops.exl3_ops.LinearEXL3_triton(
+        x_half, y, xh, trellis, suh, svh, K, mcg, mul1, bias,
+        in_features, out_features,
+    )
 
     return y.view(original_shape[:-1] + (out_features,))
