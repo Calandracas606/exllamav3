@@ -18,10 +18,6 @@ import torch.nn.functional as F
 
 from .ext import exllamav3_ext as ext
 
-# ---------------------------------------------------------------------------
-# Operator definition
-# ---------------------------------------------------------------------------
-
 _EXL3_LIBRARY_NAME = "exl3"
 
 # Register the library and operator (idempotent)
@@ -74,7 +70,7 @@ def had_r_128(
 
 
 # ---------------------------------------------------------------------------
-# Python implementation (the actual computation)
+# Python implementation — uses Triton fused dequant+GEMM
 # ---------------------------------------------------------------------------
 
 def _exl3_gemm_impl(
@@ -89,44 +85,29 @@ def _exl3_gemm_impl(
     in_features: int,
     out_features: int,
 ) -> None:
-    """Dequantize EXL3 weights and compute x @ W.
+    """Dequantize EXL3 weights and compute x @ W using Triton fused kernel."""
+    from .exl3_gemm_triton import exl3_gemm as triton_exl3_gemm
 
-    Mirrors the current ``reconstruct_hgemm`` fallback path:
-    1. Hadamard-transform the input (with suh sign correction)
-    2. Dequantize the weight matrix from trellis to fp16
-    3. fp16 matmul
-    4. Hadamard-transform the output (with svh sign correction)
+    original_shape = x.shape
+    x_flat = x.view(-1, in_features)
+    rows = x_flat.shape[0]
 
-    All operations use existing extension kernels that already work on ROCm.
-    """
-    rows = x.shape[0]
+    x_half = x_flat if x_flat.dtype == torch.half else x_flat.to(torch.half)
 
-    # Phase 1: Hadamard-transform input
-    xh = torch.empty_like(x)
-    ext.had_r_128(x, xh, suh, None, 1.0)
-
-    # Phase 2: Dequantize weights + matmul
-    MAX_SLICE_N = 32768
-    if out_features <= MAX_SLICE_N:
-        w = torch.empty(
-            (in_features, out_features),
-            dtype=torch.half,
-            device=trellis.device,
-        )
-        ext.reconstruct(w, trellis, K, mcg, mul1)
-        ext.hgemm(xh, w, y)
-    else:
-        numel_slice = in_features * MAX_SLICE_N
-        w_buf = torch.empty((numel_slice,), dtype=torch.half, device=trellis.device)
-        for n_start in range(0, out_features, MAX_SLICE_N):
-            n_end = min(n_start + MAX_SLICE_N, out_features)
-            n = n_end - n_start
-            w = w_buf[: in_features * n].view(in_features, n)
-            ext.reconstruct_slice(w, trellis, K, mcg, mul1, n_start)
-            ext.hgemm(xh, w, y[:, n_start:n_end])
-
-    # Phase 3: Hadamard-transform output (with svh sign correction)
-    ext.had_r_128(y, y, None, svh, 1.0)
+    result = triton_exl3_gemm(
+        x_half,
+        trellis,
+        suh,
+        svh,
+        K,
+        mcg,
+        mul1,
+        in_features,
+        out_features,
+        trellis.device,
+        y.dtype,
+    )
+    y.copy_(result.view(rows, out_features))
 
 
 # Register the Python implementation for all device types
@@ -166,23 +147,6 @@ def exl3_gemm(
     """Compute EXL3 fused dequant+GEMM.
 
     Allocates the output tensor and calls the registered custom op.
-
-    Args:
-        x: Input tensor, shape ``[batch..., in_features]``, will be
-            flattened to ``[batch, in_features]``.
-        trellis: EXL3-packed weight tensor.
-        suh: Sign/unscale Hadamard vector for the input (row) dimension.
-        svh: Sign/unscale Hadamard vector for the output (column) dimension.
-        K: EXL3 bitrate parameter.
-        mcg: Whether to use the MCG codebook.
-        mul1: Whether to use the mul1 codebook.
-        in_features: Input dimension (rows of the weight matrix).
-        out_features: Output dimension (columns of the weight matrix).
-        device: Device for the output tensor.
-        out_dtype: Output dtype (fp16 or fp32).
-
-    Returns:
-        Output tensor of shape ``[batch..., out_features]``.
     """
     original_shape = x.shape
     x_flat = x.view(-1, in_features)
@@ -194,7 +158,6 @@ def exl3_gemm(
         device=device,
     )
 
-    # Cast x to half if needed (the kernel operates in fp16)
     x_half = x_flat if x_flat.dtype == torch.half else x_flat.to(torch.half)
 
     torch.ops.exl3.exl3_gemm(
