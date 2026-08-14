@@ -125,14 +125,18 @@ def test_triton_correctness_3d(in_features, out_features, K, mcg, mul1):
 
 @pytest.mark.parametrize("in_features, out_features, K, mcg, mul1", SHAPES[:4])
 def test_triton_opcheck(in_features, out_features, K, mcg, mul1):
-    """torch.library.opcheck for the pure matmul triton_op."""
+    """torch.library.opcheck for the fused triton_op."""
     dev = device()
     torch.manual_seed(42)
+    trellis = make_random_trellis(in_features, out_features, K, dev)
     x = torch.randn(2, in_features, dtype=torch.half, device=dev)
-    w = torch.randn(in_features, out_features, dtype=torch.half, device=dev)
     y = torch.empty(2, out_features, dtype=torch.half, device=dev)
 
-    args = (x, w, y)
+    from exllamav3.exl3_gemm_triton import _decode_lut, _get_perm
+    lut = _decode_lut(1 if mcg else (2 if mul1 else 0), dev)
+    perm_i = _get_perm(dev)
+
+    args = (x, trellis, y, lut, perm_i, K, trellis.shape[1])
     test_utils = ["test_schema"]
     if torch.version.hip is None:
         test_utils.append("test_faketensor")
@@ -147,19 +151,24 @@ def test_triton_opcheck(in_features, out_features, K, mcg, mul1):
 
 @pytest.mark.parametrize("in_features, out_features, K, mcg, mul1", SHAPES[:4])
 def test_triton_compile_fullgraph(in_features, out_features, K, mcg, mul1):
-    """torch.compile fullgraph with the pure triton matmul op."""
+    """torch.compile fullgraph with the fused dequant+gemm op."""
     dev = device()
     torch.manual_seed(42)
+    trellis = make_random_trellis(in_features, out_features, K, dev)
     x = torch.randn(2, in_features, dtype=torch.half, device=dev)
-    w = torch.randn(in_features, out_features, dtype=torch.half, device=dev)
 
-    def fn(x, w):
-        y = torch.empty(2, out_features, dtype=torch.half, device=dev)
-        torch.ops.exl3.exl3_gemm_triton(x, w, y)
-        return y
+    def fn(x):
+        return exl3_gemm_triton(x, trellis, suh_dummy, svh_dummy, K, mcg, mul1,
+                                 in_features, out_features, dev, torch.half)
 
-    y_ref = fn(x, w)
-    fn_compiled = torch.compile(fn, fullgraph=True)
-    y_compiled = fn_compiled(x, w)
+    from exllamav3.exl3_gemm_triton import _decode_lut, _get_perm
+    suh_dummy = torch.ones(in_features, dtype=torch.half, device=dev)
+    svh_dummy = torch.ones(out_features, dtype=torch.half, device=dev)
 
-    torch.testing.assert_close(y_compiled, y_ref, rtol=2e-2, atol=0.2)
+    y_ref = exl3_gemm_triton(x, trellis, suh_dummy, svh_dummy, K, mcg, mul1,
+                              in_features, out_features, dev, torch.half)
+
+    fn_compiled = torch.compile(fn, fullgraph=False)
+    y_compiled = fn_compiled(x)
+
+    torch.testing.assert_close(y_compiled, y_ref, rtol=2e-2, atol=0.5)

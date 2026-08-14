@@ -146,86 +146,174 @@ def dequant_trellis(trellis: torch.Tensor, K: int, mcg: bool = False, mul1: bool
 # Triton matmul kernel
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Fused dequant + GEMM Triton kernel
+# ---------------------------------------------------------------------------
+
 @triton.jit
-def _matmul_kernel(
-    x_ptr, w_ptr, y_ptr,
-    M, N, K: tl.constexpr,
+def _fused_dequant_gemm_kernel(
+    x_ptr, y_ptr,
+    trellis_ptr,
+    lut_ptr,
+    perm_i_ptr,
+    M, N, K_dim,
+    tiles_n,
+    packed_size,
+    n_u32,
     stride_xm, stride_xk,
-    stride_wk, stride_wn,
+    stride_tk, stride_tn, stride_tp,
     stride_ym, stride_yn,
     BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    K_BITS: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    num_n = tl.cdiv(N, BLOCK_N)
-    pid_m = pid // num_n
-    pid_n = pid % num_n
+    pid_m = tl.program_id(0)
+    pid_n_tile = tl.program_id(1)  # one 16-column tile
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, 16)
+    offs_n = pid_n_tile * 16 + tl.arange(0, 16)
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    mask_m = offs_m < M
 
-    for k_start in range(0, K, BLOCK_K):
-        offs_k = k_start + tl.arange(0, BLOCK_K)
+    acc = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
 
-        mask_m = offs_m < M
-        mask_n = offs_n < N
-        mask_k = offs_k < K
+    n_tiles_k = K_dim // 16
 
-        x = tl.load(
-            x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-            mask=mask_m[:, None] & mask_k[None, :],
+    for k_tile in range(n_tiles_k):
+        # Load x block: [BLOCK_M, 16]
+        k_offset = k_tile * 16 + offs_k
+        x_block = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + k_offset[None, :] * stride_xk,
+            mask=mask_m[:, None],
             other=0.0,
         )
-        w = tl.load(
-            w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn,
-            mask=mask_k[:, None] & mask_n[None, :],
-            other=0.0,
-        )
-        acc += tl.dot(x, w)
 
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tile_base = k_tile * stride_tk + pid_n_tile * stride_tn
+
+        # Element index within 16x16 tile via inverse perm
+        local_k = tl.arange(0, 16)[:, None]  # [16, 1]
+        local_n = tl.arange(0, 16)[None, :]  # [1, 16]
+        elem_flat = local_k * 16 + local_n   # [16, 16]
+        elem_idx = tl.load(perm_i_ptr + elem_flat).to(tl.int32)  # [16, 16]
+
+        # Decode indices (K_BITS-specific)
+        if K_BITS == 4:
+            lane = elem_idx // 8
+            r = elem_idx % 8
+            word_low_idx = lane
+            word_high_idx = (lane + 31) % 32
+            shift = (7 - r) * 4
+        elif K_BITS == 2:
+            q16 = elem_idx // 16
+            i1 = q16
+            i0 = (i1 + 15) % 16
+            r = elem_idx % 8
+            shift0 = ((~(elem_idx // 8 * 8)) & 8) * 2
+            word_low_idx = i1
+            word_high_idx = i0
+            shift = shift0 + (7 - r) * 2
+        elif K_BITS == 1:
+            q32 = elem_idx // 32
+            i1 = q32
+            i0 = (i1 + 7) % 8
+            r = elem_idx % 8
+            shift0 = (~(elem_idx // 8 * 8)) & 24
+            word_low_idx = i1
+            word_high_idx = i0
+            shift = shift0 + (7 - r)
+        elif K_BITS == 3:
+            # dq8<bits=3>
+            t_offset = elem_idx // 8 * 8
+            r = elem_idx % 8
+            b1 = (t_offset + 257) * K_BITS
+            b0 = b1 - 16
+            b2 = b1 + K_BITS * 7
+            i0 = b0 // 32
+            i2 = (b2 - 1) // 32
+            s2 = (i2 + 1) * 32 - b2
+            word_low_idx = i2 % (K_BITS * 256 // 32)
+            word_high_idx = i0 % (K_BITS * 256 // 32)
+            shift = s2 + (7 - r) * K_BITS
+        else:
+            # Generic for K in {5,6,8}: dq4-style extraction
+            t = (elem_idx // 4) * 4
+            j = elem_idx % 4
+            b0 = (t + 257) * K_BITS - 16
+            b2 = (t + 260) * K_BITS
+            i0 = b0 // 32
+            i2 = (b2 - 1) // 32
+            s2 = (i2 + 1) * 32 - b2
+            word_low_idx = i2 % (K_BITS * 256 // 32)
+            word_high_idx = i0 % (K_BITS * 256 // 32)
+            shift = s2 + (3 - j) * K_BITS
+
+        # Gather uint32 words using computed indices.
+        # trellis is int16; promote to int64 and mask to uint16 *before*
+        # combining, so the high bit of a u16 half never sign-extends into
+        # the 64-bit funnel-shift value below.
+        word_base = tile_base
+        low_u16_0 = tl.load(trellis_ptr + word_base + word_low_idx * 2).to(tl.int64) & 0xFFFF
+        low_u16_1 = tl.load(trellis_ptr + word_base + word_low_idx * 2 + 1).to(tl.int64) & 0xFFFF
+        low_u32 = (low_u16_0 | (low_u16_1 << 16)) & 0xFFFFFFFF
+
+        high_u16_0 = tl.load(trellis_ptr + word_base + word_high_idx * 2).to(tl.int64) & 0xFFFF
+        high_u16_1 = tl.load(trellis_ptr + word_base + word_high_idx * 2 + 1).to(tl.int64) & 0xFFFF
+        high_u32 = (high_u16_0 | (high_u16_1 << 16)) & 0xFFFFFFFF
+
+        # Funnel shift and mask
+        combined = (high_u32 << 32) | low_u32
+        windows = (combined >> shift) & 0xFFFF
+
+        # LUT lookup
+        w_tile = tl.load(lut_ptr + windows)  # [16, 16] fp16
+
+        # Dot product
+        acc += tl.dot(x_block, w_tile)
+
+    # Store output
+    mask_n = offs_n < N
     tl.store(
         y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
         acc.to(y_ptr.dtype.element_ty),
-        mask=mask,
+        mask=mask_m[:, None] & mask_n[None, :],
     )
 
 
-_wrapped_matmul = torch.library.wrap_triton(_matmul_kernel)
+_wrapped_fused_kernel = torch.library.wrap_triton(_fused_dequant_gemm_kernel)
 
-
-# ---------------------------------------------------------------------------
-# triton_op registration -- pure matmul only
-# ---------------------------------------------------------------------------
 
 @torch.library.triton_op("exl3::exl3_gemm_triton", mutates_args=("y",))
 def exl3_gemm_triton(
     x: torch.Tensor,
-    w: torch.Tensor,
+    trellis: torch.Tensor,
     y: torch.Tensor,
+    lut: torch.Tensor,
+    perm_i: torch.Tensor,
+    K_bits: int,
+    tiles_n: int,
 ) -> None:
-    """Pure fp16 matmul: y = x @ w."""
-    M, K = x.shape
-    K2, N = w.shape
-    assert K == K2
+    """Fused EXL3 dequant + fp16 matmul. Does NOT materialize the weight matrix."""
+    M, K_dim = x.shape
+    N = y.shape[1]
+    packed_size = trellis.shape[-1]
 
     BLOCK_M = min(64, M) if M > 16 else 16
-    BLOCK_N = min(128, N)
-    BLOCK_K = 32
-    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
-    _wrapped_matmul[grid](
-        x, w, y,
-        M, N, K,
+    grid = (triton.cdiv(M, BLOCK_M), tiles_n)
+
+    _wrapped_fused_kernel[grid](
+        x, y,
+        trellis,
+        lut,
+        perm_i,
+        M, N, K_dim,
+        tiles_n,
+        packed_size,
+        packed_size // 2,  # n_u32
         x.stride(0), x.stride(1),
-        w.stride(0), w.stride(1),
+        trellis.stride(0), trellis.stride(1), trellis.stride(2),
         y.stride(0), y.stride(1),
         BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        num_warps=4,
+        K_BITS=K_bits,
     )
 
 
@@ -246,10 +334,9 @@ def exl3_gemm(
     device: torch.device,
     out_dtype: torch.dtype = torch.half,
 ) -> torch.Tensor:
-    """Fused EXL3 dequant + GEMM.
+    """Fused EXL3 dequant + GEMM. Does NOT materialize the weight matrix.
 
-    Dequantization is done in pure PyTorch (no ext.reconstruct).
-    The GEMM is a Triton kernel.
+    Dequantization happens tile-by-tile inside the Triton kernel.
     """
     original_shape = x.shape
     x_flat = x.view(-1, in_features)
@@ -261,12 +348,14 @@ def exl3_gemm(
     xh = torch.empty_like(x_half)
     torch.ops.exl3_ops.had_r_128(x_half, xh, suh, None, 1.0)
 
-    # Phase 2: Dequantize weights (pure PyTorch, no ext.reconstruct)
-    w = dequant_trellis(trellis, K, mcg=mcg, mul1=mul1)
+    # Phase 2+3: Fused dequant + Triton matmul (no weight matrix materialization)
+    cb = 1 if mcg else (2 if mul1 else 0)
+    lut = _decode_lut(cb, device)
+    perm_i = _get_perm(device)
+    tiles_n = trellis.shape[1]
 
-    # Phase 3: Triton matmul
     y = torch.empty((rows, out_features), dtype=out_dtype, device=device)
-    torch.ops.exl3.exl3_gemm_triton(xh, w, y)
+    torch.ops.exl3.exl3_gemm_triton(xh, trellis, y, lut, perm_i, K, tiles_n)
 
     # Phase 4: Hadamard-transform output
     torch.ops.exl3_ops.had_r_128(y, y, None, svh, 1.0)
