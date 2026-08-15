@@ -81,3 +81,31 @@
 - pytest needs EXL_TEST_DEVICE=cuda:0 on this 2-GPU box (default cuda:2 fails
   with "invalid device ordinal").
 
+## GDN b/a projection GEMV (branch gdn-ba-gemv, exllamav3/gdn_ba_gemm.py)
+- gdn.cu already contains a merged b/a GEMV kernel (gdn_ba_gemv, used by the
+  C++ BC_GatedDeltaNetSplit path) and it IS compiled on ROCm; but
+  gated_delta_net_fused_op_3 (which consumes its packed output) has no Python
+  binding, so the ROCm path used 2x rocBLAS GEMVs + fused_op_2 (~200 us/layer
+  in situ, 9.6 ms/token over 48 layers).
+- Fix: Triton kernel gdn_ba_beta_g in exllamav3/gdn_ba_gemm.py — one launch
+  computes x@[W_b;W_a] AND the fused_op_2 epilogue (beta bf16 / g fp32),
+  reusing the ba_weight_t merged buffer the BC path already fills. 11.4 us/
+  layer (0.55 ms/token). Gated in gated_delta_net.py on torch.version.hip,
+  rows<=16, x contiguous half; kill switch EXL3_GDN_BA_GEMV=0.
+- beta comes out bit-identical to the old path (bf16 absorbs dot-order noise);
+  g differs ~1e-5 (fp32 reduction order) — 200-token argmax generations
+  identical on 9B and 27B.
+- 27B decode: 14.99 -> 17.1 tok/s (66.7 -> 58.5 ms/token). Kernel is
+  latency/launch-bound (~12 us regardless of BLOCK_K/warps); no autotune.
+- Per-GDN-layer in-situ stage times (27B, events during real decode, graphs
+  off): qkv_proj 116 us, z_proj 75, b/a 11 (was 201), transpose+cast 8,
+  conv1d 11, recurrent 19, gated RMSNorm 56 (!), o_proj 95. Total 393 us/layer
+  = 18.9 ms/token over 48 layers.
+- NEXT targets, in order: (1) gated RMSNorm runs the 8-kernel torch fallback
+  (ext_fallbacks.gated_rms_norm) at 56 us/layer = 2.7 ms/token — a one-kernel
+  Triton replacement is nearly free to write; (2) the three EXL3 GEMVs
+  (qkv/z/o = 287 us/layer = 13.8 ms/token) are the real floor; (3) the
+  recurrent kernel is only 19 us/layer — NOT the bottleneck (the ~1.16 ms
+  "GDN block" floor in earlier tight-loop measurements includes eager overhead).
+
+
