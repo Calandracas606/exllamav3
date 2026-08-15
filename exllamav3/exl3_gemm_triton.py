@@ -350,13 +350,13 @@ def _exl3_gemm_early_prune(configs, named_args, **kwargs):
     """Restrict the config set per invocation:
     - Other bit widths run the generic tl.gather path, where this Triton
       build's LLVM aborts on large gather tiles.
-    - bits=4 shapes whose N/K are not divisible by a config's tile fall back
+    - bits=4/6 shapes whose N/K are not divisible by a config's tile fall back
       to the generic path too, so apply the same cap there.
-    The gather-free bits=4 fast path handles the large tiles."""
+    The gather-free bits=4 and bits=6 fast paths handle the large tiles."""
     bits = kwargs.get("K_BITS", named_args.get("K_BITS"))
     n = kwargs.get("N", named_args.get("N"))
     k = kwargs.get("K_dim", named_args.get("K_dim"))
-    fast_ok = bits == 4 and n % 128 == 0 and k % 128 == 0
+    fast_ok = bits in (4, 6) and n % 128 == 0 and k % 128 == 0
     if not fast_ok:
         small = [c for c in configs if c.kwargs["BLOCK_N"] <= 64 and c.kwargs["BLOCK_K"] <= 64]
         return small if small else configs
@@ -418,6 +418,20 @@ def _decode_word_pair(
         low64 = (low_u32.to(tl.int64) & 0xFFFFFFFF) | ((high_u32.to(tl.int64) & 0xFFFFFFFF) << 32)
         windows = ((low64 >> shift) & 0xFFFF).to(tl.uint32)
     return _decode_u16(windows.to(tl.uint32), CB)
+
+
+@triton.jit
+def _funnel6(lo, hi, s):
+    """bits=6 funnel: 16-bit code window from a (lo, hi) u32 word pair where
+    hi is the word *preceding* lo in the tile's virtual bit stream, so the
+    window can start past bit 31 of lo and the base word flips. lo, hi are
+    [NN, 16] u32; s is an [S] shift vector; returns [S, NN, 16] u32 codes."""
+    sel = s >= 32
+    s32 = s & 31
+    ns = tl.minimum(32 - s32, 31)
+    base = tl.where(sel[:, None, None], hi[None, :, :], lo[None, :, :])
+    second = tl.where(sel[:, None, None], lo[None, :, :], hi[None, :, :])
+    return ((base >> s32[:, None, None]) | (second << ns[:, None, None])) & 0xFFFF
 
 
 @triton.jit
@@ -598,6 +612,126 @@ def _fused_dequant_gemm_kernel(
                     w = tl.reshape(w, (2, 2, 2, NN, 8, 4))
                     w = tl.permute(w, (1, 5, 2, 3, 0, 4))   # (rh, q_, p, nj, ch, cl)
                     w = tl.reshape(w, (16, BLOCK_N))
+                    k_off = ktb * 16 + tl.arange(0, 16)
+                    x_block = tl.load(
+                        x_ptr + offs_m[:, None] * stride_xm + k_off[None, :] * stride_xk,
+                        mask=mask_m[:, None],
+                        other=0.0,
+                    )
+                    acc = tl.dot(x_block, w, acc)
+            tl.store(
+                y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+                acc.to(y_ptr.dtype.element_ty),
+                mask=mask_m[:, None] & mask_n[None, :],
+            )
+    elif K_BITS == 6 and (N % BLOCK_N == 0) and (K_dim % BLOCK_K == 0):
+        # ------------------------------------------------------------------
+        # bits=6 fast path (full tiles only): gather-free algebraic decode,
+        # twin of the bits=4 path. Verified against _dq_indices/_get_perm:
+        #
+        # e = 4*tg + jj,  tg = 4a + b      (jj = e%4, b = (e//4)%4, a = e//16)
+        # code(e) = funnel(word(u), word(u-1), s) with
+        #   u(e) = 3a + f(b),  f = [0,1,2,2]   (word index within the 48-word
+        #                                      tile; u-1 wraps mod 48)
+        #   s(e) = C_b - 6*jj,  C = [26, 34, 42, 18]
+        # target position of e under the _get_perm permutation (verified
+        # bijective bit-field assignment; e's bits are 32*cl + 16*(a&1) +
+        # 8*(b>>1) + 4*(b&1) + 2*j1 + j0):
+        #   r = 8*j1 + 4*(a&1) + 2*(b>>1) + j0
+        #   c = 8*(b&1) + (a>>1)
+        #
+        # Only four linear word-slice loads are needed (all contiguous over
+        # (nj, a), so everything stays coalesced, no tl.gather):
+        #   b=0: (word 3a,   word 3a-1)  shift 26-6jj
+        #   b=1: (word 3a+1, word 3a)    shift 34-6jj
+        #   b=2: (word 3a+2, word 3a+1)  shift 42-6jj
+        #   b=3: (word 3a+2, word 3a+1)  shift 18-6jj   (same words as b=2)
+        # ------------------------------------------------------------------
+        a16 = tl.arange(0, 16)
+        nj8 = tl.arange(0, NN)
+        j8 = tl.arange(0, 4)
+        # word-slice addresses relative to the subtile base (mod 48 in-tile)
+        wbase = tl.reshape(nj8[:, None] * 48 + 3 * a16[None, :], (NN * 16,))       # word 3a
+        wone = tl.reshape(nj8[:, None] * 48 + (3 * a16[None, :] + 1) % 48, (NN * 16,))  # 3a+1
+        wtwo = tl.reshape(nj8[:, None] * 48 + (3 * a16[None, :] + 2) % 48, (NN * 16,))  # 3a+2
+        wneg = tl.reshape(nj8[:, None] * 48 + (3 * a16[None, :] + 47) % 48, (NN * 16,)) # 3a-1
+        # per-b constant shifts for the 4 jj rows
+        C0 = tl.full((4,), 26, tl.int32); C1 = tl.full((4,), 34, tl.int32)
+        C2 = tl.full((4,), 42, tl.int32); C3 = tl.full((4,), 18, tl.int32)
+        sh6 = 6 * j8
+
+        if M1:
+            # GEMV: fold the permutation into the x broadcast. With
+            # r = 8*j1 + 4*a0 + 2*b1 + j0, the (j1,j0,a0,b1)-indexed x
+            # pattern comes from a reshape + permute + split of the 16
+            # values; the b=0/1 decodes multiply x[..., b1=0], b=2/3 the
+            # b1=1 half. Decodes reshape to (j1, j0, nj, cA, a0) since the
+            # a axis factors as a = 8*cA + a0 (a0 = a&1, cA = a>>1 = c%8).
+            r16 = tl.arange(0, 16)
+            acc0 = tl.zeros((2, 2, NN, 8, 2), dtype=tl.float32)
+            acc1 = tl.zeros((2, 2, NN, 8, 2), dtype=tl.float32)
+            acc2 = tl.zeros((2, 2, NN, 8, 2), dtype=tl.float32)
+            acc3 = tl.zeros((2, 2, NN, 8, 2), dtype=tl.float32)
+            for k_outer in range(n_outer):
+                for ki in tl.static_range(NK):
+                    ktb = k_outer * NK + ki
+                    row = tu32_ptr + ktb * stride_tk_u32 + base_n
+                    words2 = tl.reshape(tl.load(row + wbase), (NN, 16))
+                    wone2 = tl.reshape(tl.load(row + wone), (NN, 16))
+                    wtwo2 = tl.reshape(tl.load(row + wtwo), (NN, 16))
+                    wneg2 = tl.reshape(tl.load(row + wneg), (NN, 16))
+                    d0 = _decode_u16(_funnel6(words2, wneg2, C0 - sh6), CB).to(tl.float32)
+                    d1 = _decode_u16(_funnel6(wone2, words2, C1 - sh6), CB).to(tl.float32)
+                    d2 = _decode_u16(_funnel6(wtwo2, wone2, C2 - sh6), CB).to(tl.float32)
+                    d3 = _decode_u16(_funnel6(wtwo2, wone2, C3 - sh6), CB).to(tl.float32)
+                    xk = tl.load(x_ptr + (ktb * 16 + r16) * stride_xk).to(tl.float32)
+                    # r = 8*j1 + 4*a0 + 2*b1 + j0  =>  (r3,r2,r1,r0)=(j1,a0,b1,j0)
+                    xr = tl.permute(tl.reshape(xk, (2, 2, 2, 2)), (0, 3, 1, 2))
+                    x_lo, x_hi = tl.split(xr)
+                    x_lo = tl.broadcast_to(tl.reshape(x_lo, (2, 2, 1, 1, 2)), (2, 2, NN, 8, 2))
+                    x_hi = tl.broadcast_to(tl.reshape(x_hi, (2, 2, 1, 1, 2)), (2, 2, NN, 8, 2))
+                    acc0 += tl.reshape(d0, (2, 2, NN, 8, 2)) * x_lo
+                    acc1 += tl.reshape(d1, (2, 2, NN, 8, 2)) * x_lo
+                    acc2 += tl.reshape(d2, (2, 2, NN, 8, 2)) * x_hi
+                    acc3 += tl.reshape(d3, (2, 2, NN, 8, 2)) * x_hi
+            # reduce over (j1, j0, a0); leaves (nj, cA) per b; output
+            # n = 16*nj + 8*b0 + cA with b0 = b&1 (b=0,2 -> 0; b=1,3 -> 1)
+            s0 = tl.sum(tl.sum(tl.sum(acc0, 0), 0), 2)
+            s1 = tl.sum(tl.sum(tl.sum(acc1, 0), 0), 2)
+            s2v = tl.sum(tl.sum(tl.sum(acc2, 0), 0), 2)
+            s3 = tl.sum(tl.sum(tl.sum(acc3, 0), 0), 2)
+            h0 = s0 + s2v
+            h1 = s1 + s3
+            out = tl.permute(tl.join(h0, h1), (0, 2, 1))
+            tl.store(y_ptr + offs_n * stride_yn, tl.reshape(out, (BLOCK_N,)).to(y_ptr.dtype.element_ty), mask=mask_n)
+        else:
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for k_outer in range(n_outer):
+                for ki in tl.static_range(NK):
+                    ktb = k_outer * NK + ki
+                    row = tu32_ptr + ktb * stride_tk_u32 + base_n
+                    words2 = tl.reshape(tl.load(row + wbase), (NN, 16))
+                    wone2 = tl.reshape(tl.load(row + wone), (NN, 16))
+                    wtwo2 = tl.reshape(tl.load(row + wtwo), (NN, 16))
+                    wneg2 = tl.reshape(tl.load(row + wneg), (NN, 16))
+                    d0 = _decode_u16(_funnel6(words2, wneg2, C0 - sh6), CB)
+                    d1 = _decode_u16(_funnel6(wone2, words2, C1 - sh6), CB)
+                    d2 = _decode_u16(_funnel6(wtwo2, wone2, C2 - sh6), CB)
+                    d3 = _decode_u16(_funnel6(wtwo2, wone2, C3 - sh6), CB)
+                    # reorder to (r, n): decode is [jj, nj, a]; reshape to
+                    # (j1, j0, nj, cA, a0) — a = 8*cA + a0 with a0 = a&1 and
+                    # cA = a>>1 = c%8 — then permute to
+                    # (j1, a0, b1, j0, nj, b0, cA) and fold
+                    # r = 8*j1 + 4*a0 + 2*b1 + j0, n = 16*nj + 8*b0 + cA.
+                    P0 = tl.permute(tl.reshape(d0, (2, 2, NN, 8, 2)), (0, 1, 4, 2, 3))
+                    P1 = tl.permute(tl.reshape(d1, (2, 2, NN, 8, 2)), (0, 1, 4, 2, 3))
+                    P2 = tl.permute(tl.reshape(d2, (2, 2, NN, 8, 2)), (0, 1, 4, 2, 3))
+                    P3 = tl.permute(tl.reshape(d3, (2, 2, NN, 8, 2)), (0, 1, 4, 2, 3))
+                    J0 = tl.join(P0, P2)      # (j1, j0, a0, nj, cA, b1)
+                    J1 = tl.join(P1, P3)
+                    Wt = tl.join(J0, J1)      # (j1, j0, a0, nj, cA, b1, b0)
+                    Wt = tl.permute(Wt, (0, 2, 5, 1, 3, 6, 4))
+                    w = tl.reshape(Wt, (16, BLOCK_N))
                     k_off = ktb * 16 + tl.arange(0, 16)
                     x_block = tl.load(
                         x_ptr + offs_m[:, None] * stride_xm + k_off[None, :] * stride_xk,
