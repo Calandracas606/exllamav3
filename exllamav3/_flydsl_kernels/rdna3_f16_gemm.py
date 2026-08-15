@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 FlyDSL Project Contributors
+"""WMMA GEMM kernel for RDNA3 / RDNA3.5 (gfx11*, wave32).
+
+Ported from rdna_f16_gemm.py (gfx120x). Same algorithm (4-warp double-
+buffered LDS ping-pong, 128x128x32 tiles, swizzled grid mapping) but
+adapted for the legacy v16-operand WMMA ABI used by RDNA3/RDNA3.5:
+
+  * Input operands (A, B) are vector<16> instead of vector<8>; each
+    lane carries 16 contiguous K-elements of one M (or N) row. Lanes
+    0-15 carry distinct rows; lanes 16-31 carry duplicates of the same
+    rows lanes 0-15 read. We just have all lanes do the LDS loads —
+    duplicate loads are wasted bandwidth but simpler than a wave-half
+    broadcast.
+    TODO(perf): lanes 16-31 could ``ds_swizzle_b32`` XOR 16 broadcast
+    from lanes 0-15 to halve LDS read bandwidth.
+
+  * Accumulator (C/D) is still vector<8>, but the per-lane row mapping
+    differs from gfx12: lane L holds D[2*si + (L/16)][L%16], i.e. even
+    rows in lanes 0-15 and odd rows in lanes 16-31. The store-back loop
+    uses ``g_row = base + 2*si + klane`` instead of the gfx12
+    ``g_row = base + 8*klane + si``.
+
+Computes C[M,N] = A[M,K] @ B_T[N,K]^T (same interface as
+``rdna_f16_gemm.create_wmma_gemm_module``).
+
+The block tile is a parameter and defaults to 128x128x32. Deciding it from the
+shape -- which is worth up to 3.0x on shapes too small to fill the grid -- is
+the job of ``rdna3_f16_gemm_autotune``; this module only builds what it is told.
+"""
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.dialects import vector
+from flydsl.expr import as_ir_value, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import T
+from flydsl.runtime.device import get_rocm_arch
+from .kernels_common import cvt_sr_f32_to_bf16
+
+WMMA_M = 16
+WMMA_N = 16
+WMMA_K = 16
+WAVE_SIZE = 32
+
+# The k-padding both operands pay to break LDS bank conflicts. Also the default
+# for a_k_pad/b_k_pad below, so a caller sizing a tile against the LDS budget can
+# assume it without the two drifting apart.
+K_PAD = 8
+
+
+def _group_width(grid_m, group_m):
+    """Largest grouping width <= group_m that divides grid_m.
+
+    ``_swizzle_tile_id`` derives bid_m from a fixed group width, so a grid_m that
+    is not a multiple of it makes the final group address tiles past the end of
+    the grid. That is reachable at the default 128x128 tile: on gfx1100 it writes
+    a wrong C at M of 1152, 1280 and 1664, and faults outright at 1536 and 2560,
+    depending on whether the address past the grid happens to be mapped.
+    """
+    return max(d for d in range(1, min(group_m, grid_m) + 1) if grid_m % d == 0)
+
+
+def _swizzle_tile_id(pid, grid_n, group_width):
+    """Linear workgroup id -> (bid_m, bid_n).
+
+    Walks group_width tiles down M before stepping in N, so workgroups that run
+    concurrently share B tiles in L2. Plain integer arithmetic, so it evaluates
+    the same on a host int as on the kernel's block id.
+    """
+    num_pid_in_group = group_width * grid_n
+    group_id = pid // num_pid_in_group
+    pid_in_group = pid % num_pid_in_group
+    return group_id * group_width + (pid_in_group % group_width), pid_in_group // group_width
+
+
+def create_wmma_gemm_module(
+    M: int,
+    N: int,
+    K: int,
+    in_dtype="bf16",
+    out_dtype="bf16",
+    *,
+    rounding="rn",  # "rn" (round to nearest) or "rs" (stochastic rounding)
+    # 128x128x32. That tile is right once the problem is large enough to fill the
+    # grid, but it cuts only 4 workgroups at 256x256 on a 96-CU part, so most CUs
+    # idle. Choosing a tile from the shape is worth up to 3.0x there and lives in
+    # rdna3_f16_gemm_autotune, which drives these arguments.
+    reg_m=4,
+    reg_n=4,
+    reg_k=2,
+    waves_m=2,
+    waves_n=2,
+    group_m=8,
+    a_k_pad=K_PAD,
+    b_k_pad=K_PAD,
+):
+    gpu_arch = str(get_rocm_arch() or "")
+    if not gpu_arch.startswith("gfx11"):
+        raise RuntimeError(
+            f"rdna3_f16_gemm requires gfx11* (RDNA3 / RDNA3.5); current arch is {gpu_arch!r}. "
+            "Use rdna_f16_gemm.create_wmma_gemm_module on gfx120* (RDNA4)."
+        )
+
+    BLOCK_M = WMMA_M * reg_m * waves_m  # 128
+    BLOCK_N = WMMA_N * reg_n * waves_n  # 128
+    BLOCK_K = WMMA_K * reg_k  # 32
+    NUM_WAVES = waves_m * waves_n  # 4
+    THREADS_PER_BLOCK = NUM_WAVES * WAVE_SIZE  # 128
+
+    assert reg_k >= 2 and reg_k % 2 == 0
+    assert rounding in ("rn", "rs"), f"rounding must be 'rn' or 'rs', got {rounding!r}"
+    if rounding == "rs":
+        assert out_dtype == "bf16", "stochastic rounding currently supports bf16 output only"
+
+    LOAD_VEC = 8  # 8 bf16 = 128-bit GMEM/LDS load
+    # G2S thread geometry: thread (tk, tm) moves the 128-bit chunk at columns
+    # [tk*LOAD_VEC, +LOAD_VEC) of row tm, and the tiled copy repeats over M to
+    # cover the tile. Same assignment the hand-rolled offset tables computed as
+    # ``row = tid // THRS_K, col = (tid % THRS_K) * LOAD_VEC``.
+    THRS_K = BLOCK_K // LOAD_VEC
+    THRS_M = THREADS_PER_BLOCK // THRS_K
+    assert THRS_K * THRS_M == THREADS_PER_BLOCK
+    assert BLOCK_M % THRS_M == 0 and BLOCK_N % THRS_M == 0
+
+    BLOCK_K_PAD_A = BLOCK_K + a_k_pad  # 40
+    BLOCK_K_PAD_B = BLOCK_K + b_k_pad  # 40
+    LDS_A_SIZE = BLOCK_M * BLOCK_K_PAD_A
+    LDS_B_SIZE = BLOCK_N * BLOCK_K_PAD_B
+    LDS_ONE_BUF = LDS_A_SIZE + LDS_B_SIZE
+    LDS_TOTAL = 2 * LDS_ONE_BUF
+
+    assert M % BLOCK_M == 0
+    assert N % BLOCK_N == 0
+    assert K % BLOCK_K == 0
+
+    num_k_tiles = K // BLOCK_K
+    if num_k_tiles < 2:
+        raise ValueError(f"Need at least 2 K-tiles for prefetch pipeline; got K={K}, BLOCK_K={BLOCK_K}")
+
+    grid_m = M // BLOCK_M
+    grid_n = N // BLOCK_N
+
+    group_width = _group_width(grid_m, group_m)
+
+    is_bf16 = in_dtype == "bf16"
+
+    def _wmma_op(a_vec, b_vec, acc):
+        # On gfx11 the WMMA intrinsic takes v16 inputs (and v8 accumulator).
+        if is_bf16:
+            a_i16 = a_vec.bitcast(fx.Int16)
+            b_i16 = b_vec.bitcast(fx.Int16)
+            return rocdl.wmma_f32_16x16x16_bf16(acc.type, a_i16, b_i16, acc).result
+        return rocdl.wmma_f32_16x16x16_f16(acc.type, a_vec, b_vec, acc).result
+
+    elem_dtype = fx.BFloat16 if is_bf16 else fx.Float16
+    out_elem_cls = {"bf16": fx.BFloat16, "f16": fx.Float16, "f32": fx.Float32}[out_dtype]
+    acc_size = 8 * reg_m * reg_n  # accumulator f32 VGPRs per thread
+
+    # ── Shared-memory storage for double-buffered A+B LDS tiles ──────────
+    # One flat bf16/f16 array; v8 chunks are addressed by byte_offset // 2
+    # (element-index = byte_offset / sizeof(elem)) inside the kernel.
+    # 16-byte alignment so the underlying buffer is suitable for v8 loads
+    # (8 * 2 bytes = 16 bytes).
+    @fx.struct
+    class _SharedStorage:
+        lds: fx.Array[elem_dtype, LDS_TOTAL, 16]
+
+    @flyc.kernel
+    def wmma_gemm_kernel(
+        arg_c: fx.Tensor,
+        arg_a: fx.Tensor,
+        arg_bt: fx.Tensor,
+        tiled_mma: fx.TiledMma,
+        tiled_copy_g2s: fx.TiledCopy,
+        sr_seed: fx.Int32,  # runtime seed; only read on the stochastic-rounding path
+    ):
+        lds_storage = fx.SharedAllocator().allocate(_SharedStorage).peek()
+        lds_ptr = lds_storage.lds.ptr  # i8-base aliased as elem_dtype*
+
+        # ── v8 load/store helpers — element-indexed (v8_idx = byte_offset // 2 // 8) ──
+        # Mirrors fp8_gemm_utils.S2RLoader._vec_load_16xf8: byte-offset the
+        # pointer, recast to the element dtype, project into a v8 view.
+        def _v8_load(v8_idx):
+            elem_off = fx.Int32(v8_idx * 8)  # v8 chunks are 8 elements wide
+            ptr_off = fx.add_offset(lds_ptr, fx.make_int_tuple(elem_off))
+            typed_ptr = fx.recast_iter(elem_dtype, ptr_off)
+            return fx.make_view(typed_ptr, fx.make_layout(8, 1)).load()
+
+        tid = gpu.thread_id("x")
+        pid = gpu.block_id("x")
+
+        wave_id = tid // 32
+        lane = tid % 32
+        # On gfx11 the v16 ABI has lanes 16-31 mirror lanes 0-15, so the
+        # M (or N) row is selected by ``lane % 16`` only. No klane shift
+        # in the K dimension — each lane carries all 16 K-elements.
+        lane16 = lane % 16
+
+        bid_m, bid_n = _swizzle_tile_id(pid, grid_n, group_width)
+
+        wave_m = wave_id // waves_n
+        wave_n = wave_id % waves_n
+
+        # Wave wm owns the contiguous row band [wm*reg_m*16, +reg_m*16). A
+        # tiled_mma stamps its wave grid across the tile instead, putting repeat
+        # rm at row (rm*waves_m + wm)*16; measured on gfx1100 that interleaving
+        # costs 62% at 3072x3072x1024 (269 -> 436 us) while gaining 3-8% on the
+        # medium shapes, so a tiled_mma standing in for this loop has to carry a
+        # permutation that restores the banding rather than adopt the default.
+
+        # Result partition. The tiled_mma carries a permutation that reproduces
+        # the wave banding above, so the accumulators land where the hand-rolled
+        # ``g_row = base + 2*si + klane`` store used to put them.
+        tC = fx.flat_divide(fx.rocdl.make_buffer_tensor(arg_c), fx.make_tile(BLOCK_M, BLOCK_N))[
+            None, None, bid_m, bid_n
+        ]
+        thr_mma = tiled_mma.thr_slice(tid)
+        frag_C = thr_mma.make_fragment_C(tC)
+        copy_out = fx.make_copy_atom(fx.rocdl.BufferCopy(out_elem_cls.width), out_elem_cls)
+        thr_r2g_C = fx.make_tiled_copy_C(copy_out, tiled_mma).get_slice(tid)
+        pC_g = thr_r2g_C.partition_S(tC)
+        if const_expr(out_elem_cls is fx.Float32):
+            frag_C_out = frag_C
+        else:
+            frag_C_out = fx.make_fragment_like(frag_C, out_elem_cls.ir_type)
+        frag_C_retile = thr_r2g_C.retile(frag_C_out)
+
+        # ============================================================
+        # GMEM -> registers -> LDS, through the tiled copy
+        # ============================================================
+        tA = fx.flat_divide(fx.rocdl.make_buffer_tensor(arg_a), fx.make_tile(BLOCK_M, BLOCK_K))[None, None, bid_m, None]
+        tB = fx.flat_divide(fx.rocdl.make_buffer_tensor(arg_bt), fx.make_tile(BLOCK_N, BLOCK_K))[
+            None, None, bid_n, None
+        ]
+
+        thr_g2s = tiled_copy_g2s.get_slice(tid)
+        pA_g = thr_g2s.partition_S(tA)
+        pB_g = thr_g2s.partition_S(tB)
+
+        buf_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
+        uni_copy = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
+
+        # The destination buffer alternates on ``iv % 2``, a loop-carried value,
+        # so it cannot be selected from a list of per-stage views at trace time.
+        # The view is built from the running element offset into the single LDS
+        # allocation instead, which is what the flat _v8_store did by hand.
+        def _lds_dst(buf_offset, base, rows, row_stride):
+            ptr = fx.add_offset(lds_ptr, fx.make_int_tuple(buf_offset + base))
+            view = fx.make_view(fx.recast_iter(elem_dtype, ptr), fx.make_layout((rows, BLOCK_K), (row_stride, 1)))
+            return thr_g2s.partition_D(view)[None, None, None]
+
+        def _pA_s(buf_offset):
+            return _lds_dst(buf_offset, 0, BLOCK_M, BLOCK_K_PAD_A)
+
+        def _pB_s(buf_offset):
+            return _lds_dst(buf_offset, LDS_A_SIZE, BLOCK_N, BLOCK_K_PAD_B)
+
+        frag_copy_A = fx.make_fragment_like(_pA_s(0))
+        frag_copy_B = fx.make_fragment_like(_pB_s(0))
+
+        def _gmem_load(k_tile):
+            fx.copy(buf_copy, pA_g[None, None, None, k_tile], frag_copy_A)
+            fx.copy(buf_copy, pB_g[None, None, None, k_tile], frag_copy_B)
+
+        def _lds_store(buf_offset):
+            fx.copy(uni_copy, frag_copy_A, _pA_s(buf_offset))
+            fx.copy(uni_copy, frag_copy_B, _pB_s(buf_offset))
+
+        # ============================================================
+        # LDS read helpers — v16 by concatenating two v8 loads
+        # ============================================================
+        # gfx11's v16 operand has element layout: lane L (L%16) carries 16
+        # contiguous K-elements of row (lane%16). So per WMMA K-tile we
+        # need 16 K-elements, stored as two contiguous v8 chunks at
+        # offsets ``col_lo = 16*rk`` and ``col_hi = 16*rk + 8``.
+        _concat16_mask = list(range(16))  # shuffle mask for v8 ++ v8 → v16
+
+        def _load_b_from_lds(rk, buf_offset):
+            vecs = []
+            col_lo = 16 * rk
+            col_hi = 16 * rk + 8
+            for rn in range_constexpr(reg_n):
+                row = wave_n * (reg_n * WMMA_N) + 16 * rn + lane16
+                lds_idx_lo = buf_offset + LDS_A_SIZE + row * BLOCK_K_PAD_B + col_lo
+                lds_idx_hi = buf_offset + LDS_A_SIZE + row * BLOCK_K_PAD_B + col_hi
+                v_lo = _v8_load(lds_idx_lo // 8)
+                v_hi = _v8_load(lds_idx_hi // 8)
+                vecs.append(v_lo.shuffle(v_hi, _concat16_mask))
+            return vecs
+
+        def _load_a_single_from_lds(rk, rm_val, buf_offset):
+            col_lo = 16 * rk
+            col_hi = 16 * rk + 8
+            row = wave_m * (reg_m * WMMA_M) + 16 * rm_val + lane16
+            lds_idx_lo = buf_offset + row * BLOCK_K_PAD_A + col_lo
+            lds_idx_hi = buf_offset + row * BLOCK_K_PAD_A + col_hi
+            v_lo = _v8_load(lds_idx_lo // 8)
+            v_hi = _v8_load(lds_idx_hi // 8)
+            return v_lo.shuffle(v_hi, _concat16_mask)
+
+        def _barrier():
+            # gfx11 barrier — split signal/wait and s_wait_dscnt are gfx12+.
+            _llvm.inline_asm(
+                res=None,
+                operands_=[],
+                asm_string="s_waitcnt lgkmcnt(0)\ns_barrier",
+                constraints="",
+                has_side_effects=True,
+            )
+
+        def _do_compute_rk(accs_in, rk, buf_offset):
+            new_accs = list(accs_in)
+            b_vecs = _load_b_from_lds(rk, buf_offset)
+            for rm in range_constexpr(reg_m):
+                a_vec = _load_a_single_from_lds(rk, rm, buf_offset)
+                for rn in range_constexpr(reg_n):
+                    idx = rm * reg_n + rn
+                    new_accs[idx] = _wmma_op(
+                        a_vec,
+                        b_vecs[rn],
+                        new_accs[idx],
+                    )
+            return new_accs
+
+        zero_acc = fx.full(8, 0.0, fx.Float32)
+        accs = [zero_acc for _ in range_constexpr(reg_m * reg_n)]
+
+        c_lds_buf_stride = LDS_ONE_BUF
+
+        # --- PROLOGUE ---
+        _gmem_load(fx.Int32(0))
+        _lds_store(0)
+        _barrier()
+
+        n_acc = reg_m * reg_n
+        init_state = list(accs)
+
+        for iv, state in range(0, num_k_tiles - 1, 1, init=init_state):
+            s_accs = list(state[:n_acc])
+
+            read_off = iv % 2 * c_lds_buf_stride
+            write_off = (1 - iv % 2) * c_lds_buf_stride
+
+            _gmem_load(iv + 1)
+
+            for rk in range_constexpr(reg_k):
+                s_accs = _do_compute_rk(s_accs, rk, read_off)
+
+            _lds_store(write_off)
+            _barrier()
+
+            results = yield list(s_accs)
+
+        accs = list(results[:n_acc])
+
+        last_read_off = ((num_k_tiles - 1) % 2) * c_lds_buf_stride
+        for rk in range_constexpr(reg_k):
+            accs = _do_compute_rk(accs, rk, last_read_off)
+
+        # ============================================================
+        # Store results to GMEM through the tiled copy
+        # ============================================================
+        # The gfx11 v8f32 accumulator (lane L holds D[2*si + L/16][L%16]) and the
+        # wave banding are both encoded in the tiled_mma, so the row arithmetic
+        # that used to live here is gone. What remains is the value transform,
+        # which no copy atom can express.
+        #
+        # frag_C flattens as si + 8*(rm + reg_m*rn), so each run of 8 elements is
+        # exactly one atom's accumulator, and one Philox draw still covers one run.
+        ordered_accs = [accs[rm * reg_n + rn] for rn in range_constexpr(reg_n) for rm in range_constexpr(reg_m)]
+        if const_expr(rounding == "rs"):
+            # The 4 random words cover all 8 values, each taking a distinct
+            # 16-bit slice (low/high of a word), so the f32 -> bf16 store is
+            # unbiased in expectation without a per-element draw. Keying on the
+            # thread's slot rather than the output coordinate keeps the draw
+            # independent of where the tiled copy lands the fragment.
+            out_elems = []
+            for g, acc in enumerate(ordered_accs):
+                base_off = (pid * THREADS_PER_BLOCK + tid) * acc_size + 8 * g
+                words = fx.random.randint4x(fx.Uint32(sr_seed), fx.Uint32(base_off))
+                for si in range_constexpr(8):
+                    word = words[si // 2]
+                    rbits = word if si % 2 == 0 else (word >> fx.Uint32(16))
+                    out_elems.append(cvt_sr_f32_to_bf16(acc[si], rbits))
+        elif const_expr(out_elem_cls is fx.Float32):
+            out_elems = [acc[si] for acc in ordered_accs for si in range_constexpr(8)]
+        else:
+            out_elems = [acc[si].to(out_elem_cls) for acc in ordered_accs for si in range_constexpr(8)]
+
+        frag_C_out.store(
+            vector.from_elements(T.vec(acc_size, out_elem_cls.ir_type), [as_ir_value(e) for e in out_elems])
+        )
+        fx.copy(copy_out, frag_C_retile, pC_g)
+
+    @flyc.jit
+    def launch_gemm(
+        arg_c: fx.Tensor,
+        arg_a: fx.Tensor,
+        arg_bt: fx.Tensor,
+        stream: fx.Stream,
+        sr_seed: fx.Int32 = 0,
+    ):
+        # 16x16x16 v16 WMMA atom (gfx11.wmma) over a waves_m x waves_n wave grid.
+        # The permutation spans the whole block tile and remaps the natural
+        # (atom, wave, repeat) coordinate so wave wm keeps the contiguous band
+        # [wm*reg_m*16, +reg_m*16); the default stamping interleaves the repeats
+        # instead, which measured 62% slower at 3072x3072x1024.
+        mma_atom = fx.make_mma_atom(fx.rocdl.WMMA(WMMA_M, WMMA_N, WMMA_K, elem_dtype, fx.Float32))
+        tiled_mma = fx.make_tiled_mma(
+            mma_atom,
+            fx.make_layout((waves_m, waves_n, 1), (waves_n, 1, 0)),
+            permutation=(
+                fx.make_layout((WMMA_M, waves_m, reg_m), (1, WMMA_M * reg_m, WMMA_M)),
+                fx.make_layout((WMMA_N, waves_n, reg_n), (1, WMMA_N * reg_n, WMMA_N)),
+                WMMA_K,
+            ),
+        )
+        # G2S tiled copy: thread (tk, tm) moves one 128-bit contiguous chunk of
+        # row tm, repeated over M to cover the block tile.
+        tiled_copy_g2s = fx.make_tiled_copy(
+            fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype),
+            fx.make_layout(
+                ((THRS_K, THRS_M), (1, LOAD_VEC)),
+                ((THRS_M * LOAD_VEC, 1), (1, THRS_M)),
+            ),
+            fx.make_tile(THRS_M, BLOCK_K),
+        )
+
+        arg_a_2d = fx.make_view(fx.get_iter(arg_a), fx.make_layout((M, K), (K, 1)))
+        arg_bt_2d = fx.make_view(fx.get_iter(arg_bt), fx.make_layout((N, K), (K, 1)))
+        arg_c_2d = fx.make_view(fx.get_iter(arg_c), fx.make_layout((M, N), (N, 1)))
+
+        c1 = 1
+        total_blocks = grid_m * grid_n
+        bk = THREADS_PER_BLOCK
+
+        launcher = wmma_gemm_kernel(arg_c_2d, arg_a_2d, arg_bt_2d, tiled_mma, tiled_copy_g2s, sr_seed)
+        launcher.launch(
+            grid=(total_blocks, c1, c1),
+            block=(bk, c1, c1),
+            stream=stream,
+        )
+
+    return launch_gemm, BLOCK_M, BLOCK_N, BLOCK_K
