@@ -173,7 +173,12 @@ if torch.version.hip:
 
     _bc_none = _BCNone()
 
-    # BC_* constructors: return None when the class isn't compiled
+    # BC_* constructors: default every name to the None-yielding stub, then
+    # install the real Python graph-capturing implementations for the linear
+    # classes (defined in bc_rocm.py) when the Triton kernels they dispatch to
+    # (triton-kernels line) are importable. Without the kernels the stubs
+    # yield None and linears fall back to reconstruct_hgemm, so this line
+    # (rocm-plumbing) stays valid standalone.
     for _name in [
         'BC_Mamba2', 'BC_GatedDeltaNet', 'BC_GatedDeltaNetSplit',
         'BC_MLP', 'BC_GatedMLP', 'BC_BlockSparseMLP',
@@ -184,6 +189,13 @@ if torch.version.hip:
     ]:
         if not hasattr(exllamav3_ext, _name):
             setattr(exllamav3_ext, _name, _bc_none)
+    try:
+        import exllamav3.exl3_gemm_triton as _exl3_kernels  # noqa: F401
+        from .bc_rocm import BC_LinearEXL3, BC_LinearFP16
+        exllamav3_ext.BC_LinearEXL3 = BC_LinearEXL3
+        exllamav3_ext.BC_LinearFP16 = BC_LinearFP16
+    except ImportError:
+        pass
 
     # C++ functions from excluded source files: replace with PyTorch implementations
     from . import ext_fallbacks as _fb
@@ -205,3 +217,10 @@ if torch.version.hip:
     if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE'):
         setattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE', 0)
     os.environ.setdefault('EXL3_FUSED_SAMPLER', '0')
+
+    # The graph-captured BC attention block (bc_attn.py) depends on ext.BC_Attention and
+    # ext.TritonKernel, neither of which is compiled on ROCm. Now that BC_LinearEXL3 is a
+    # real (non-None) object, the attention gating in _module_eligible would otherwise turn
+    # the path on and crash in _compile_kernel. Disable it here so attention falls back to
+    # the regular dispatch path, while the EXL3 linear layers still benefit from graph capture.
+    os.environ.setdefault('EXL3_BC_ATTN', '0')

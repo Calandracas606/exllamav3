@@ -10,6 +10,12 @@ from .model_ls import Model_LSMixin
 from ..util.tensor import g_tensor_cache
 from ..cache.recurrent_util import advance_recurrent_states
 
+if torch.version.hip:
+    from ..block_graph_rocm import maybe_bg_forward
+else:
+    def maybe_bg_forward(model, input_ids, params):
+        return None
+
 class Model(Model_TPMixin, Model_LSMixin):
 
     def __init__(
@@ -224,7 +230,11 @@ class Model(Model_TPMixin, Model_LSMixin):
             advance_recurrent_states(input_ids, params, self)
             return y
         else:
-            y = self.forward_ls(x, params)
+            # ROCm whole-step CUDA graph for bsz=1 decode (no-op elsewhere/when
+            # disabled); returns None to take the regular layer-split path
+            y = maybe_bg_forward(self, x, params)
+            if y is None:
+                y = self.forward_ls(x, params)
             advance_recurrent_states(input_ids, params, self)
             return y
 
