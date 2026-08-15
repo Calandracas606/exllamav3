@@ -1,4 +1,13 @@
 """Quick end-to-end model inference test with AITER bridge on ROCm gfx1100."""
+
+import pytest
+
+if __name__ != "__main__":
+    pytest.skip(
+        "script-style test; run directly: python tests/test_aiter_model.py [model_dir]",
+        allow_module_level=True,
+    )
+
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

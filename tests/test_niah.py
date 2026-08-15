@@ -3,6 +3,15 @@
 Generates a long context prompt with a hidden reference value, asks the model
 to retrieve it, and checks correctness. Tests multiple context lengths.
 """
+
+import pytest
+
+if __name__ != "__main__":
+    pytest.skip(
+        "script-style test; run directly: python tests/test_niah.py [model_dir]",
+        allow_module_level=True,
+    )
+
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("AITER_TRITON_ONLY", "1")
