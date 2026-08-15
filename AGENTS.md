@@ -109,3 +109,65 @@
   "GDN block" floor in earlier tight-loop measurements includes eager overhead).
 
 
+
+## Full-attention decode decomposition + optimization (branch attn-decode-opt)
+- Methodology upgrade: cross-session tok/s varies +-1.5% (clock/power state) and
+  CPU load (YouTube, compiles) can cost 15%+. ONLY trust in-process interleaved
+  A/B (ab_bench.py: same model load, toggling paths per round) and ablation
+  deltas (Attention.forward monkeypatched to zeros gives the "no-attn" rate).
+  Eager per-kernel event timings also include CPU launch time when the GPU
+  idles - kernel-proxy numbers with graphs off overstate kernel cost.
+- 27B attn layer: 24 q heads / 4 kv heads / head_dim 256, q_norm+k_norm fused
+  into ext.rope, interleaved q|g gate in q_proj (N=12288 incl gate), k/v
+  N=1024 each, o_proj N=5120 K=6144, all EXL3 bits=4 CB=2. 16 such layers.
+- Breakdown (eager, graphs off, per layer): q_proj 116 us, deint 25, k+v 111,
+  rope 11, attn_dispatch 192 (kv_update 9 + split 35 + combine 25 pure-kernel,
+  rest gaps), gate 14, o_proj 96. Pure decode GEMV kernel times (in-situ):
+  q 100, k 69, v 69, o ~75-155 -> attention block total 5.28 ms/token
+  (ablation, graphs on).
+- Root causes fixed (all bit-identical to the reference path, verified by
+  torch.equal on every output tensor):
+  1. k/v GEMVs launch only 8-16 CTAs (N=1024) -> latency-bound at ~4 GB/s.
+     NEW exllamav3/attn_rocm_kernels.py: had3 (3 sign-vector input Hadamards,
+     one launch) + gemv3 (q+k+v GEMV in ONE launch, BLOCK_N=128, output
+     Hadamards fused in-register in the epilogue, interleaved q|g store
+     remapped per CTA - the deinterleave kernel is eliminated). Wired in
+     attn.py (_project_qkv_fused_rocm), gated on torch.version.hip + geometry
+     checks, kill switch EXL3_ATTN_QKV_FUSED=0. DRAM-cold interleaved A/B:
+     68.5 us vs 125 us for the 3 reference projections (1.8x).
+  2. o_proj via a direct exl3_ops::LinearEXL3_triton call into persistent
+     buffers (no per-linear BC copy_ + clone): 2 fewer nodes per call.
+  3. Paged attention: the combine kernel ran 4 CTAs (one per kv head)
+     reading 2 MB of partials -> row-split grid (16 CTAs), per-element
+     split-sum order unchanged (bit-identical). Plus
+     _paged_attn_decode_fused_kernel: split+combine in one launch with an
+     atomic last-block reduction (acq_rel counter, self-resetting); partials
+     land in L2 and are re-read hot. Gate: torch.version.hip, fp16 cache, no
+     sinks, kill switch EXL3_PAGED_FUSED=0.
+- Result (in-process A/B + ablation, idle machine): attention block
+  5.28 -> 4.36 ms/token (-17%), full model 58.90 -> 57.89 ms/token
+  (17.0 -> 17.3 tok/s in that session; the 17.36 baseline was measured in a
+  faster session - absolute tok/s is only comparable within one session).
+- FLOOR ANALYSIS (why 18.5 tok/s is not reachable in the attention bucket):
+  906 MB/token attention weights (q 31.5 + k 2.6 + v 2.6 + o 20 MB per layer
+  x16) + ~38 MB KV = 944 MB/token. Measured block cost 4.36 ms = 216 GB/s
+  effective. Best demonstrated rate for these dequant-GEMV kernels DRAM-cold
+  standalone (hot clocks): 480-630 GB/s; in-situ (dirty L2 from 13.6 GB/token
+  streaming) halves that. Even at 500 GB/s sustained the block would cost
+  ~2.2 ms -> best case ~17.9-18.0 tok/s whole-model. 18.5 needs 590 GB/s
+  in-situ - beyond anything measured on this GPU for 4bpw trellis streams.
+  The GEMV bandwidth itself lives in exl3_gemm_triton.py (read-only here).
+- Whole-model stream rate: 13.6 GB / 57.9 ms = 235 GB/s (~1/4 of peak DRAM);
+  the systemic bottleneck is the dequant-GEMV access pattern + small-kernel
+  latency, not attention-specific structure.
+- Trellis-layout experiment (removed): permuting the q/k/v trellises to
+  [n_subtile, k_tile, words] (bit-identical values, n-major streaming) was
+  verified correct but measured NO faster in situ (3-way A/B: 57.91 vs
+  57.98 ms/token, within noise). The ~270 GB/s in-situ GEMV rate is the
+  DRAM/queue behavior of the trellis streams, not a coalescing artifact.
+  Private-graph kernel microbenches are UNSOUND on ROCm (independent nodes
+  overlap inside a graph, evict-kernel subtraction goes negative) - only
+  in-model A/B + ablation are trustworthy.
+- cuda:1 on this box fails in the model LOADER (async OOM reported at
+  _decode_lut's arange during weight load; the same op works in isolation).
+  Pre-existing, unrelated to NCCL/RCCL; keep everything on cuda:0.

@@ -38,7 +38,7 @@ def main():
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens=args.cache)
     tokenizer = Tokenizer(config)
-    model.load(progressbar=False, device="cuda:0")
+    model.load(progressbar=False, device=os.environ.get("DEVICE", "cuda:0"))
     torch.cuda.synchronize()
     vram = torch.cuda.memory_allocated() / 1e9
     print(f"Loaded. VRAM: {vram:.1f} GB")

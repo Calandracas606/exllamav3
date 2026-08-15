@@ -35,6 +35,16 @@ def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
 from ..util.tensor import g_tensor_cache
 from .attention_fn import attn_dispatch
 
+# ROCm decode fast path: fused q/k/v projection kernels (attn_rocm_kernels).
+# Plain Triton launches captured by the whole-step graph like any other op.
+_rocm_fused_qkv = (
+    torch.version.hip and
+    os.environ.get("EXL3_ATTN_QKV_FUSED", "1") != "0"
+)
+if _rocm_fused_qkv:
+    from ..attn_rocm_kernels import fused_qkv_had, fused_qkv_gemv
+
+
 """
                    
 Flash Attention:
@@ -397,6 +407,9 @@ class Attention(Module):
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
 
+        self._rocm_fused = None
+        self._rocm_o = None
+
 
     @override
     def optimizer_targets(self):
@@ -520,6 +533,9 @@ class Attention(Module):
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
 
+        self._rocm_fused = None
+        self._rocm_o = None
+
 
     @override
     def forward(
@@ -547,6 +563,88 @@ class Attention(Module):
                 params["backend"].all_reduce(x)
 
         return to2(x, out_dtype, self.out_dtype)
+
+
+    def _project_qkv_fused_rocm(self, x: torch.Tensor, params: dict) -> tuple | None:
+        """Single-launch q/k/v projection for ROCm decode (see attn_rocm_kernels).
+
+        Computes all three EXL3 GEMVs in one kernel (the narrow N=1024 k/v
+        matrices would otherwise launch starved 8-CTA kernels) with the input
+        Hadamards sharing one launch and the output Hadamards fused into the
+        GEMV epilogue. Outputs are bit-identical to the separate path; returns
+        None (caller falls back) for anything but the plain decode case.
+        """
+        if not _rocm_fused_qkv:
+            return None
+        bsz, q_len, dim = x.shape
+        if bsz * q_len != 1 or x.dtype != torch.half or not x.is_contiguous():
+            return None
+        if self.multi_qg is not None or self.multi_kv is not None or self.v_proj is None:
+            return None
+        if self.interleaved_gate and self.head_dim % 8 != 0:
+            return None
+        if self.v_norm is not None or self.ve_gate:
+            return None  # would need to write into the shared v buffer
+        if self.interleaved_gate and self.head_dim % 128 != 0:
+            return None  # interleaved store assumes one tile per output half
+        if params.get("capture") or self.q_proj.lora_a_tensors:
+            return None
+        f = self._rocm_fused
+        if f is None:
+            inners = (self.q_proj.inner, self.k_proj.inner, self.v_proj.inner)
+            if any(i is None for i in inners):
+                return None
+            if any(getattr(i, "quant_type", None) != "exl3" for i in inners):
+                return None
+            for i in inners:
+                if i.bias is not None or i.K != inners[0].K or i.in_features != inners[0].in_features:
+                    return None
+                if i.trellis.shape[-1] != 64:  # 32 u32 words per 16x16 subtile == bits=4
+                    return None
+                if i.out_features % 128 or i.in_features % 128:
+                    return None
+            cbs = {1 if i.mcg else (2 if i.mul1 else 0) for i in inners}
+            if len(cbs) != 1:
+                return None
+            if self.interleaved_gate and inners[0].out_features != 2 * self.num_q_heads * self.head_dim:
+                return None
+            K = inners[0].in_features
+            dev = self.device
+            f = self._rocm_fused = {
+                "K": K,
+                "cb": cbs.pop(),
+                "tq": inners[0].trellis, "svhq": inners[0].svh, "suhq": inners[0].suh,
+                "tk": inners[1].trellis, "svhk": inners[1].svh, "suhk": inners[1].suh,
+                "tv": inners[2].trellis, "svhv": inners[2].svh, "suhv": inners[2].suh,
+                "xh": [torch.empty((K,), dtype=torch.half, device=dev) for _ in range(3)],
+                "yq": torch.empty((inners[0].out_features,), dtype=torch.half, device=dev),
+                "yk": torch.empty((inners[1].out_features,), dtype=torch.half, device=dev),
+                "yv": torch.empty((inners[2].out_features,), dtype=torch.half, device=dev),
+                "q": torch.empty((1, 1, self.num_q_heads, self.head_dim), dtype=torch.half, device=dev),
+                "g": torch.empty((1, 1, self.num_q_heads * self.head_dim), dtype=torch.half, device=dev),
+            }
+        if x.shape[-1] != f["K"]:
+            return None
+
+        fused_qkv_had(x, f["suhq"], f["suhk"], f["suhv"], f["xh"])
+        if self.interleaved_gate:
+            # interleaved store: the kernel writes the deinterleaved q and g
+            # halves directly (bit-identical to ext.deinterleave_qg)
+            fused_qkv_gemv(f["xh"][0], f["xh"][1], f["xh"][2],
+                           f["tq"], f["tk"], f["tv"], f["svhq"], f["svhk"], f["svhv"],
+                           f["q"].view(-1), f["yk"], f["yv"], f["cb"],
+                           g_out=f["g"].view(-1), qg_interleaved=True, head_dim=self.head_dim)
+            q = f["q"]
+            g = f["g"]
+        else:
+            fused_qkv_gemv(f["xh"][0], f["xh"][1], f["xh"][2],
+                           f["tq"], f["tk"], f["tv"], f["svhq"], f["svhk"], f["svhv"],
+                           f["yq"], f["yk"], f["yv"], f["cb"], head_dim=self.head_dim)
+            q = f["yq"].view(1, 1, self.num_q_heads, self.head_dim)
+            g = None
+        k = f["yk"].view(1, 1, self.num_kv_heads, self.head_dim)
+        v = f["yv"].view(1, 1, self.num_kv_heads, self.head_dim)
+        return q, k, v, g
 
 
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
@@ -646,8 +744,44 @@ class Attention(Module):
 
     def project_o(self, o: torch.Tensor, bsz: int, seqlen: int, params: dict) -> torch.Tensor:
         # o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
+        if _rocm_fused_qkv:
+            x = self._project_o_direct_rocm(o)
+            if x is not None:
+                return x
         x = self.o_proj.forward(o, params)
         return x
+
+    def _project_o_direct_rocm(self, o: torch.Tensor) -> torch.Tensor | None:
+        """o_proj as a direct exl3_ops::LinearEXL3_triton call into persistent
+        buffers (ROCm decode): skips the per-linear BC path's input copy and
+        output clone (two extra GPU nodes per call at ~14 us/node graph
+        frontend cost). Same kernels, bit-identical result."""
+        if o.dtype != torch.half or not o.is_contiguous() or o.numel() != o.shape[-1]:
+            return None
+        inner = getattr(self.o_proj, "inner", None)
+        if inner is None or inner.bias is not None:
+            return None
+        if getattr(inner, "quant_type", None) != "exl3":
+            return None
+        if getattr(self.o_proj, "trim_padded_out", False) and self.o_proj.out_features != self.o_proj.out_features_unpadded:
+            return None
+        if self.o_proj.lora_a_tensors:
+            return None
+        d = self._rocm_o
+        if d is None:
+            d = self._rocm_o = {
+                "inner": inner,
+                "xh": torch.empty((1, inner.in_features), dtype=torch.half, device=self.device),
+                "y": torch.empty((1, inner.out_features), dtype=inner.default_out_dtype, device=self.device),
+            }
+        if o.shape[-1] != inner.in_features:
+            return None
+        torch.ops.exl3_ops.LinearEXL3_triton(
+            o.view(1, -1), d["y"], d["xh"], inner.trellis, inner.suh, inner.svh,
+            inner.K, inner.mcg, inner.mul1, None,
+            inner.in_features, inner.out_features,
+        )
+        return d["y"].view(o.shape[:-1] + (inner.out_features,))
 
 
     def apply_qk_norms_tp(
@@ -848,7 +982,11 @@ class Attention(Module):
             if o is not None:
                 return o
 
-        q, k, v, g = self.project_qkv(x, params)
+        qkv = self._project_qkv_fused_rocm(x, params)
+        if qkv is not None:
+            q, k, v, g = qkv
+        else:
+            q, k, v, g = self.project_qkv(x, params)
 
         # Optional addend to V tensor (e.g. value embeddings)
         if self.ve_gate:
