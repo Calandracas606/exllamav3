@@ -25,6 +25,11 @@ _WARMUP_ITERS = 3
 # just ensures the kernels are loaded before the capture region begins.
 _CAPTURE_WARMUP_ITERS = 1
 
+# While a whole-step graph (block_graph_rocm) is being captured, set to True so
+# these per-linear graphs launch their kernels directly (recorded as nodes of
+# the outer graph) instead of replaying as nested graphs.
+capture_suppress = False
+
 
 class BC_LinearEXL3:
     """Graph-capturing EXL3 linear for the bsz == 1 decode path.
@@ -131,8 +136,10 @@ class BC_LinearEXL3:
 
         # The captured graph is only valid for the bsz == 1 shape. Any other shape
         # runs the regular (non-captured) compute path, exactly like the C++ version
-        # which only graph-captures bsz == 1.
-        if rows == 1 and x_flat.dtype == torch.half:
+        # which only graph-captures bsz == 1. When a whole-step graph is being
+        # captured (block_graph_rocm), run uncaptured so the kernels become nodes
+        # of the outer graph.
+        if rows == 1 and x_flat.dtype == torch.half and not capture_suppress:
             graph = self._graphs.get(out_dtype)
             if graph is not None:
                 # Replay path: copy input into static buffer, replay, clone the static
