@@ -139,6 +139,24 @@ class LinearEXL3:
 
         reconstruct = params.get("reconstruct")
         if not reconstruct:
+            # Opt-in FlyDSL GEMV for the M == 1 decode path (EXL3_GEMM_FLY=1,
+            # flydsl line only). Guarded lazy import: falls through when
+            # flydsl isn't installed or the shape isn't M == 1.
+            if (
+                os.environ.get("EXL3_GEMM_FLY", "0") != "0"
+                and x.dim() == 2 and x.shape[0] == 1
+            ):
+                try:
+                    from .exl3_gemm_fly import exl3_gemm_fly
+                    return exl3_gemm_fly(
+                        x, self.trellis, self.suh, self.svh, self.K,
+                        self.mcg, self.mul1, self.in_features,
+                        self.out_features, self.trellis.device,
+                        out_dtype or self.default_out_dtype, self.bias,
+                    )
+                except ImportError:
+                    pass
+
             if use_triton:
                 dtype = out_dtype or self.default_out_dtype
                 return linear_exl3_triton(
