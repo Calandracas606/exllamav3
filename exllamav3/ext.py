@@ -210,6 +210,14 @@ if torch.version.hip:
         if not hasattr(exllamav3_ext, _name):
             setattr(exllamav3_ext, _name, getattr(_fb, _name))
 
+    # When AITER is available, register custom ops and upgrade norm fallbacks
+    from .aiter_kernels import is_aiter_available as _aiter_ok
+    if _aiter_ok():
+        from . import aiter_kernels as _ak
+        _ak._register_custom_ops()
+        for _name in ['rms_norm', 'rms_norm_res_in']:
+            setattr(exllamav3_ext, _name, getattr(_ak, _name))
+
     # Constants and functions guarded by fused_sampler_enable in generator/sampler/custom.py.
     # Disable the fused sampler path on ROCm by setting the flag and providing stub values.
     if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_MAX_BLOCKS'):
