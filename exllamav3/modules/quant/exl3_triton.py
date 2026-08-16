@@ -16,10 +16,12 @@ on the decode path):
                                              # (+ optional bias)
 
 The fused kernel decodes the EXL3 trellis tile-by-tile inside the K-loop
-without materializing the weight matrix. Bits 4 and 6 use a gather-free
+without materializing the weight matrix. Bits 2-6 and 8 use a gather-free
 algebraic decode (the per-element word/shift lookup reduces to per-axis bit
 fields, so packed rows load as linear u32 vectors and the subtile permutation
-is realized by static reshapes); other bit widths use a generic gather path.
+is realized by static reshapes). The remaining widths (K = 1, 7) hit a
+degeneracy in that algebra and are routed to the C++ reconstruct + hgemm
+pipeline instead (see ``linear_exl3_triton``).
 """
 from __future__ import annotations
 
@@ -140,15 +142,14 @@ def _had_r_128_kernel(
 # had_r_128_triton: Triton row Hadamard transform
 #
 # A Triton twin of the C++ pybind ``ext.had_r_128`` (quant/hadamard.cu),
-# bit-identical by construction. Used ONLY inside LinearEXL3_triton so that
-# the whole EXL3 linear path depends on Triton alone; every other caller
-# keeps using the C++ kernel through pybind.
+# bit-identical by construction. Used ONLY inside the Triton EXL3 linear
+# path so that path depends on Triton alone; every other caller keeps
+# using the C++ kernel through pybind.
 #
 # Scope note: its kernel time matches or beats the C++ kernel at every shape
 # (measured via CUDA-graph replay), but an EAGER call from Python pays the
-# torch.ops dispatch + Triton launch path — roughly 2-3x the pybind call's
-# cost. It exists for the graph-captured path, where launch overhead does not
-# apply; don't adopt it on uncaptured hot paths.
+# Python launch path. It exists for the graph-captured path, where launch
+# overhead does not apply; don't adopt it on uncaptured hot paths.
 # ---------------------------------------------------------------------------
 
 _RSCALE_128 = 0.088388347648  # 1/sqrt(128), matches the C++ literal
@@ -869,11 +870,11 @@ def _linear_exl3_triton(
 
     Writes the Hadamard-transformed input to ``xh`` and the result to ``y``.
     All tensors must be pre-allocated with stable addresses for CUDA graph
-    capture; nothing is allocated inside this op.
+    capture; nothing is allocated inside this call.
     """
     # A cast here would allocate and silently break a capturing graph; callers
-    # that need dtype conversion must cast before invoking the op.
-    assert x.dtype == torch.half, f"LinearEXL3_triton: expected half input, got {x.dtype}"
+    # that need dtype conversion must cast before calling.
+    assert x.dtype == torch.half, f"_linear_exl3_triton: expected half input, got {x.dtype}"
 
     # Phase 1: input Hadamard transform -> xh
     had_r_128_triton(x, xh, suh, None, 1.0)
@@ -893,6 +894,13 @@ def _linear_exl3_triton(
         y.add_(bias)
 
 
+# Bit widths the fused Triton kernel covers. K = 1 and 7 degenerate in the
+# decode algebra (the per-axis bit-field split of the word/shift lookup no
+# longer lines up with the 16-element subtile packing) and produce wrong
+# results; those widths are routed to the C++ pipeline by linear_exl3_triton.
+_TRITON_K_SUPPORTED = {2, 3, 4, 5, 6, 8}
+
+
 def linear_exl3_triton(
     x: torch.Tensor,
     trellis: torch.Tensor,
@@ -909,9 +917,9 @@ def linear_exl3_triton(
 ) -> torch.Tensor:
     """Fused EXL3 dequant + GEMM, allocating and returning the output.
 
-    Thin convenience wrapper over ``exl3_ops::LinearEXL3_triton``. The BC
-    (graph-capture) path calls the op directly to keep tensor addresses
-    stable across replays.
+    Convenience wrapper over ``_linear_exl3_triton`` for uncaptured callers;
+    graph-capturing paths (BC) call the preallocated-buffer function directly
+    to keep tensor addresses stable across replays.
 
     The per-call ``xh`` workspace allocation is deliberate and cheap: the
     caching allocator serves it from its free list (no cudaMalloc, no sync)
@@ -923,6 +931,21 @@ def linear_exl3_triton(
     rows = x_flat.shape[0]
 
     x_half = x_flat if x_flat.dtype == torch.half else x_flat.to(torch.half)
+
+    if K not in _TRITON_K_SUPPORTED:
+        # Unsupported width: C++ reconstruct + hgemm pipeline
+        from ...ext import exllamav3_ext as _ext
+        xh = torch.empty_like(x_half)
+        _ext.had_r_128(x_half, xh, suh, None, 1.0)
+        w = torch.empty((in_features, out_features), dtype=torch.half, device=device)
+        _ext.reconstruct(w, trellis, K, mcg, mul1)
+        y = torch.empty((rows, out_features), dtype=torch.half, device=device)
+        _ext.hgemm(xh, w, y)
+        _ext.had_r_128(y, y, None, svh, 1.0)
+        if bias is not None:
+            y = y + bias
+        y = y if out_dtype == torch.half else y.to(out_dtype)
+        return y.view(original_shape[:-1] + (out_features,))
 
     y = torch.empty((rows, out_features), dtype=out_dtype, device=device)
     xh = torch.empty_like(x_half)
