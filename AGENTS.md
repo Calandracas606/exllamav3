@@ -17,10 +17,12 @@ upstream/dev (trunk)
 │       └── rocm-flydsl        exl3_gemm_fly.py — FlyDSL dequant+GEMV (opt-in,
 │                                EXL3_GEMM_FLY=1, default OFF; beats Triton on the
 │                                6-bit lm_head stream; optional flydsl wheel dep)
-└── triton-kernels             exl3_gemm_triton.py, gdn_ba_gemm.py, attn_rocm_kernels.py,
-                                tests/test_exl3_gemm_triton.py, bench/bench_exl3_gemm.py
+└── triton-kernels             modules/quant/exl3_triton.py + tests/test_exl3_triton.py
+                                (the ONLY upstreamable kernel line; plain functions,
+                                no torch.library; EXL3_PREFER_TRITON_LINEAR=1)
 
 integration = merge(rocm-aiter, rocm-flydsl, triton-kernels) + this AGENTS.md + fork README
+                (attn_rocm_kernels.py / gdn_ba_gemm.py / bc tests live on rocm-plumbing)
 ```
 
 ### Hard rules
@@ -30,8 +32,9 @@ integration = merge(rocm-aiter, rocm-flydsl, triton-kernels) + this AGENTS.md + 
    rebase the plumbing line onto the new tip (`git rebase --onto <new> <old> rocm-plumbing`)
    then restack (`gs upstack restack`).
 2. **File-slice rule** — which line a change belongs on:
-   - `exllamav3/exl3_gemm_triton.py`, `gdn_ba_gemm.py`, `attn_rocm_kernels.py`,
-     `tests/test_exl3_gemm_triton.py`, `bench/*` → **triton-kernels** (portable, CUDA-testable)
+   - `modules/quant/exl3_triton.py`, `tests/test_exl3_triton.py` → **triton-kernels**
+     (upstreamable; CUDA-testable; plain-function calls, NO torch.library ops —
+     the author rejects op registration for dispatch-overhead reasons)
    - Anything gated on `torch.version.hip`, ext.py dispatch, bc_rocm/block_graph_rocm,
      call-site wiring in exl3.py / gated_delta_net.py / attn.py / triton_paged.py / model.py
      → **rocm-plumbing**
