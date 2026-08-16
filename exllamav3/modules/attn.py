@@ -762,7 +762,7 @@ class Attention(Module):
         return x
 
     def _project_o_direct_rocm(self, o: torch.Tensor) -> torch.Tensor | None:
-        """o_proj as a direct exl3_ops::LinearEXL3_triton call into persistent
+        """o_proj as a direct _linear_exl3_triton call into persistent
         buffers (ROCm decode): skips the per-linear BC path's input copy and
         output clone (two extra GPU nodes per call at ~14 us/node graph
         frontend cost). Same kernels, bit-identical result."""
@@ -786,7 +786,8 @@ class Attention(Module):
             }
         if o.shape[-1] != inner.in_features:
             return None
-        torch.ops.exl3_ops.LinearEXL3_triton(
+        from ..modules.quant.exl3_triton import _linear_exl3_triton
+        _linear_exl3_triton(
             o.view(1, -1), d["y"], d["xh"], inner.trellis, inner.suh, inner.svh,
             inner.K, inner.mcg, inner.mul1, None,
             inner.in_features, inner.out_features,

@@ -157,8 +157,8 @@ class LinearEXL3:
         # through to reconstruct_hgemm so this line stays valid standalone.
         if self.bc is None:
             try:
-                from ...exl3_gemm_triton import exl3_gemm
-                return exl3_gemm(
+                from .exl3_triton import linear_exl3_triton
+                return linear_exl3_triton(
                     x, self.trellis, self.suh, self.svh, self.K,
                     self.mcg, self.mul1, self.in_features, self.out_features,
                     self.trellis.device, out_dtype or self.default_out_dtype,

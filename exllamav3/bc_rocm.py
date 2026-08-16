@@ -8,7 +8,7 @@ the Python dispatch path.
 
 This module reimplements the hot-path classes in pure Python on top of
 ``torch.cuda.CUDAGraph``. The whole linear forward —
-``exl3_ops::LinearEXL3_triton`` (hadamard -> fused-dequant-gemm -> hadamard,
+``_linear_exl3_triton`` (hadamard -> fused-dequant-gemm -> hadamard,
 + optional bias) — is captured once into a graph and replayed, so a decoded
 token pays one graph launch per layer instead of per-kernel dispatch.
 """
@@ -79,10 +79,10 @@ class BC_LinearEXL3:
         """Run the complete EXL3 linear into ``static_y`` via the composition op.
 
         Imports at call time so importing bc_rocm (from ext.py) doesn't pull in
-        triton, and so the op is registered before first use. Must only be
-        called after the static buffers are populated.
+        triton. Must only be called after the static buffers are populated.
         """
-        torch.ops.exl3_ops.LinearEXL3_triton(
+        from .modules.quant.exl3_triton import _linear_exl3_triton
+        _linear_exl3_triton(
             self._static_x, static_y, self._static_xh,
             self.trellis, self.suh, self.svh,
             self.K, self.mcg, self.mul1, self.bias,
@@ -164,8 +164,8 @@ class BC_LinearEXL3:
 
     def _run_uncaptured(self, x_flat: torch.Tensor, out_features: int, out_dtype: torch.dtype) -> torch.Tensor:
         """Regular exl3_gemm compute (no graph capture), returning a fresh tensor."""
-        from .exl3_gemm_triton import exl3_gemm
-        return exl3_gemm(
+        from .modules.quant.exl3_triton import linear_exl3_triton
+        return linear_exl3_triton(
             x_flat, self.trellis, self.suh, self.svh, self.K,
             self.mcg, self.mul1, self.in_features, out_features,
             self.device, out_dtype, self.bias,

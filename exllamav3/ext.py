@@ -190,7 +190,7 @@ if torch.version.hip:
         if not hasattr(exllamav3_ext, _name):
             setattr(exllamav3_ext, _name, _bc_none)
     try:
-        import exllamav3.exl3_gemm_triton as _exl3_kernels  # noqa: F401
+        import exllamav3.modules.quant.exl3_triton as _exl3_kernels  # noqa: F401
         from .bc_rocm import BC_LinearEXL3, BC_LinearFP16
         exllamav3_ext.BC_LinearEXL3 = BC_LinearEXL3
         exllamav3_ext.BC_LinearFP16 = BC_LinearFP16
