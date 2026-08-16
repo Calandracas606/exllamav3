@@ -303,3 +303,11 @@ integration = merge(rocm-aiter, rocm-flydsl, triton-kernels) + this AGENTS.md + 
   per-chunk W materialization, NOT a GEMM engine swap (max ~1.1x from GEMMs).
 - Upstream FlyDSL repo has NO rdna3_f16_gemm_autotune.py despite the docstring
   referencing it; tile selection must be hand-swept.
+
+### Per-K Triton GEMV throughput (RX 7900 XTX, 1x5120x248320, M=1)
+K1 137 | K2 276 | K3 449 | K4 554 | K5 463 | K6 685 | K7 633 | K8 757 GB/s
+(low-K paths are ALU-bound ~1100-1200 Gweights/s, not byte-bound; K3
+reached 449 via the run-group funnel decode — 8 groups of 4 windows
+share one 32-bit funnel each — independently verified at 452).
+9B per-bitwidth eval/perf.py profiles with EXL3_PREFER_TRITON_LINEAR=1:
+decode 38-47 tok/s across the 2.0-6.0bpw models; 4.0bpw fastest (44-47).
