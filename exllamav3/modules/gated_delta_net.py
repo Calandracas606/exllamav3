@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
@@ -513,6 +514,7 @@ class GatedDeltaNet(Module):
         self.ba_weight_t = None
         self.ba_bias = None
         self.ba_weight_filled = False
+        self.ba_gemv_max_rows = 0
 
         self.recurrent_layers = []
         self.tp_recurrent_lookup = {}
@@ -639,6 +641,21 @@ class GatedDeltaNet(Module):
             )
             self.bc_split = self.bc is not None
 
+            # On ROCm the BC_* C++ path isn't compiled; route the merged b/a projection through
+            # the fused Triton GEMV instead (also used by the C++ path via gdn_ba_gemv on CUDA).
+            # Falls back to the regular per-projection path if the kernel is unavailable.
+            # Kill switch: EXL3_GDN_BA_GEMV=0
+            if (
+                not self.bc_split and torch.version.hip and
+                self.dt_bias is not None and self.a_log is not None and
+                os.environ.get("EXL3_GDN_BA_GEMV", "1") != "0"
+            ):
+                try:
+                    from ..gdn_ba_gemm import _BA_MAX_ROWS
+                    self.ba_gemv_max_rows = _BA_MAX_ROWS
+                except Exception:
+                    self.ba_gemv_max_rows = 0
+
 
     @override
     def load(self, device: torch.Device, **kwargs):
@@ -668,6 +685,7 @@ class GatedDeltaNet(Module):
         self.ba_weight_t = None
         self.ba_bias = None
         self.ba_weight_filled = False
+        self.ba_gemv_max_rows = 0
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
@@ -798,7 +816,7 @@ class GatedDeltaNet(Module):
             save_history = False  # no SD without prior state, for simplicity
 
         # Deferred fill of the merged b/a projection (weights are materialized by now)
-        if self.bc_split and not self.ba_weight_filled:
+        if (self.bc_split or self.ba_gemv_max_rows > 0) and not self.ba_weight_filled:
             self.ba_weight_t.copy_(torch.cat([
                 self.b_proj.inner.get_weight_tensor(),
                 self.a_proj.inner.get_weight_tensor(),
@@ -855,23 +873,52 @@ class GatedDeltaNet(Module):
                 self.beta_scale
             )
         else:
+            # ROCm fast path: one fused Triton GEMV computes the merged b/a projection and the
+            # beta/g epilogue, replacing two rocBLAS GEMVs (pathological at N=48) plus
+            # gated_delta_net_fused_op_2. Plain stream launch, so it captures in CUDA graphs.
+            use_ba_gemv = (
+                self.ba_gemv_max_rows > 0 and
+                self.ba_weight_filled and
+                x.dtype == torch.half and
+                x.is_contiguous() and
+                x.shape[-1] == self.ba_weight_t.shape[1] and
+                bsz * seqlen <= self.ba_gemv_max_rows
+            )
+
             qkv = self.qkv_proj.forward(x, params)
             z = self.z_proj.forward(x, params).view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
-            b = self.b_proj.forward(x, params)
-            a = self.a_proj.forward(x, params)
 
-            mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            if use_ba_gemv:
+                from ..gdn_ba_gemm import gdn_ba_beta_g
+                nv = self.num_v_heads
+                beta = torch.empty((bsz, seqlen, nv), dtype = torch.bfloat16, device = self.device)
+                g = torch.empty((bsz, seqlen, nv), dtype = torch.float, device = self.device)
+                gdn_ba_beta_g(
+                    x.view(-1, self.hidden_size),
+                    self.ba_weight_t,
+                    self.ba_bias,
+                    self.dt_bias,
+                    self.a_log,
+                    beta.view(-1, nv),
+                    g.view(-1, nv),
+                    self.beta_scale
+                )
+                mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            else:
+                b = self.b_proj.forward(x, params)
+                a = self.a_proj.forward(x, params)
 
-            beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
-            g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
+                beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
+                g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
 
-            ext.gated_delta_net_fused_op_2(
-                b, a,
-                self.dt_bias,
-                self.a_log,
-                beta, g,
-                self.beta_scale
-            )
+                ext.gated_delta_net_fused_op_2(
+                    b, a,
+                    self.dt_bias,
+                    self.a_log,
+                    beta, g,
+                    self.beta_scale
+                )
+                mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
 
         # Convolution
         mixed_qkv = causal_conv1d_update(

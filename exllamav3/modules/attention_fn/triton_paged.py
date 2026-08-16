@@ -1002,9 +1002,15 @@ def _paged_attn_decode_combine_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    ROWS_PER_PROG: tl.constexpr = 0,  # 0: legacy one program per pid; else rows are split across grid axis 1
 ):
     """Flash-decoding phase 2: reduce the per-split partial accumulators."""
     pid = tl.program_id(0)
+    if ROWS_PER_PROG:
+        row_pid = tl.program_id(1)
+        rows = row_pid * ROWS_PER_PROG + tl.arange(0, ROWS_PER_PROG)
+    else:
+        rows = tl.arange(0, BLOCK_ROWS)
 
     group_size = n_q_heads // n_kv_heads
     h_blocks = tl.cdiv(group_size, BLOCK_H)
@@ -1013,15 +1019,15 @@ def _paged_attn_decode_combine_kernel(
     batch = bh // n_kv_heads
     kv_head = bh - batch * n_kv_heads
 
-    rows = tl.arange(0, BLOCK_ROWS)
     row_q = rows % BLOCK_M
     row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
     q_head = kv_head * group_size + row_h_local
     valid_row = (row_q < q_len) & (row_h_local < group_size)
 
     offs_d = tl.arange(0, head_dim)
+    R: tl.constexpr = ROWS_PER_PROG if ROWS_PER_PROG else BLOCK_ROWS
 
-    m_max = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
+    m_max = tl.full((R,), -float("inf"), tl.float32)
     for s in range(num_splits):
         ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
         m_s = tl.load(partial_ml + ml_base + rows * 2)
@@ -1032,8 +1038,8 @@ def _paged_attn_decode_combine_kernel(
         sink = tl.load(sinks + q_head, mask=valid_row, other=0.0).to(tl.float32)
         m_max = tl.maximum(m_max, sink)
 
-    l_sum = tl.zeros((BLOCK_ROWS,), tl.float32)
-    acc = tl.zeros((BLOCK_ROWS, head_dim), tl.float32)
+    l_sum = tl.zeros((R,), tl.float32)
+    acc = tl.zeros((R, head_dim), tl.float32)
     m_safe = tl.where(m_max == -float("inf"), 0.0, m_max)
     for s in range(num_splits):
         ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
@@ -1054,7 +1060,156 @@ def _paged_attn_decode_combine_kernel(
     tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None])
 
 
+@triton.jit
+def _paged_attn_decode_fused_kernel(
+    q,
+    k_cache,
+    v_cache,
+    block_table,
+    cache_seqlens,
+    out,
+    partial_o,
+    partial_ml,
+    counters,
+    split_len,
+    num_pages_per_seq,
+    num_splits,
+    q_len: tl.constexpr,
+    kv_append_len: tl.constexpr,
+    n_q_heads: tl.constexpr,
+    n_kv_heads: tl.constexpr,
+    page_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    scale: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
+    SOFTCAP: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Flash-decoding with the combine fused via a last-block reduction (fp16
+    caches): each (program, split) CTA stores its partials exactly like the
+    split kernel, then bumps a per-program counter; the last CTA to finish
+    reduces all partials exactly like the combine kernel (identical order and
+    arithmetic, bit-identical results) and resets the counter to zero for the
+    next launch. Saves one launch plus a cold re-read of the partials."""
+    pid = tl.program_id(0)
+    split = tl.program_id(1)
+
+    group_size = n_q_heads // n_kv_heads
+    h_blocks = tl.cdiv(group_size, BLOCK_H)
+    h_block = pid % h_blocks
+    bh = pid // h_blocks
+    batch = bh // n_kv_heads
+    kv_head = bh - batch * n_kv_heads
+
+    rows = tl.arange(0, BLOCK_ROWS)
+    row_q = rows % BLOCK_M
+    row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
+    q_head = kv_head * group_size + row_h_local
+    valid_row = (row_q < q_len) & (row_h_local < group_size)
+
+    offs_d = tl.arange(0, head_dim)
+    q_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
+    q_tile = tl.load(q + q_base[:, None] + offs_d[None, :], mask=valid_row[:, None], other=0.0)
+
+    total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
+    q_abs = total_k_len - q_len + row_q
+
+    n_start = split * split_len
+    n_end = tl.minimum(n_start + split_len, total_k_len)
+
+    m = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
+    l = tl.full((BLOCK_ROWS,), 0.0, tl.float32)
+    acc = tl.zeros((BLOCK_ROWS, head_dim), tl.float32)
+
+    for n0 in range(n_start, n_end, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        page = offs_n // page_size
+        page_off = offs_n - page * page_size
+        phys = tl.load(
+            block_table + batch * num_pages_per_seq + page,
+            mask=offs_n < n_end,
+            other=0,
+        )
+        k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
+        k_tile = tl.load(k_ptrs, mask=offs_n[None, :] < n_end, other=0.0)
+        scores = tl.dot(q_tile, k_tile) * scale
+
+        valid = valid_row[:, None] & (offs_n[None, :] < n_end)
+        if CAUSAL:
+            valid = valid & (offs_n[None, :] <= q_abs[:, None])
+        if WINDOW_LEFT >= 0:
+            valid = valid & (offs_n[None, :] >= q_abs[:, None] - WINDOW_LEFT)
+        if WINDOW_RIGHT >= 0:
+            valid = valid & (offs_n[None, :] <= q_abs[:, None] + WINDOW_RIGHT)
+        scores = tl.where(valid, scores, -float("inf"))
+
+        m_new = tl.maximum(m, tl.max(scores, axis=1))
+        m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
+        p = tl.exp(scores - m_exp[:, None])
+        p = tl.where(valid, p, 0.0)
+        alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
+        l_new = l * alpha + tl.sum(p, axis=1)
+
+        v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
+        v_tile = tl.load(v_ptrs, mask=offs_n[:, None] < n_end, other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
+        m = m_new
+        l = l_new
+
+    po_base = (pid * num_splits + split) * BLOCK_ROWS * head_dim
+    tl.store(partial_o + po_base + rows[:, None] * head_dim + offs_d[None, :], acc)
+    ml_base = (pid * num_splits + split) * BLOCK_ROWS * 2
+    tl.store(partial_ml + ml_base + rows * 2, m)
+    tl.store(partial_ml + ml_base + rows * 2 + 1, l)
+
+    # publish partials, then count ourselves; the last CTA reduces
+    prev = tl.atomic_add(counters + pid, 1, sem="acq_rel")
+    if prev == num_splits - 1:
+        m_max = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
+        for sp in range(num_splits):
+            ml_b = (pid * num_splits + sp) * BLOCK_ROWS * 2
+            m_max = tl.maximum(m_max, tl.load(partial_ml + ml_b + rows * 2))
+        l_sum = tl.zeros((BLOCK_ROWS,), tl.float32)
+        racc = tl.zeros((BLOCK_ROWS, head_dim), tl.float32)
+        m_safe = tl.where(m_max == -float("inf"), 0.0, m_max)
+        for sp in range(num_splits):
+            ml_b = (pid * num_splits + sp) * BLOCK_ROWS * 2
+            m_s = tl.load(partial_ml + ml_b + rows * 2)
+            l_s = tl.load(partial_ml + ml_b + rows * 2 + 1)
+            w = tl.where(m_s == -float("inf"), 0.0, tl.exp(m_s - m_safe))
+            po_b = (pid * num_splits + sp) * BLOCK_ROWS * head_dim
+            o_s = tl.load(partial_o + po_b + rows[:, None] * head_dim + offs_d[None, :])
+            racc += o_s * w[:, None]
+            l_sum += l_s * w
+        out_tile = racc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
+        out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
+        tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None])
+        tl.store(counters + pid, 0)
+
+
 _decode_sm_count = {}
+
+# Fused split+combine decode kernel (fp16 caches, no sinks): one launch with a
+# last-block reduction instead of split + combine. ROCm-gated.
+_paged_fused = (
+    has_triton and
+    bool(getattr(torch.version, "hip", None)) and
+    os.environ.get("EXL3_PAGED_FUSED", "1") != "0"
+)
+_fused_counters = {}
+
+
+def _get_counters(device, programs: int) -> torch.Tensor:
+    key = (device.index, programs)
+    c = _fused_counters.get(key)
+    if c is None:
+        c = _fused_counters[key] = torch.zeros((programs,), dtype=torch.int32, device=device)
+    return c
 
 def paged_attn_triton_decode(
     q: torch.Tensor,
@@ -1170,6 +1325,14 @@ def paged_attn_triton_decode(
         partial_o = q   # unused
         partial_ml = q  # unused
 
+    use_fused = (
+        _paged_fused and
+        qc is None and
+        not has_sinks and
+        num_splits > 1 and
+        softcap == 0.0
+    )
+
     with torch.cuda.device(q.device):
         if k is not None and kv_append_len:
             update_block_d = triton.next_power_of_2(head_dim)
@@ -1178,6 +1341,20 @@ def paged_attn_triton_decode(
                 num_pages_per_seq, kv_append_len, n_kv_heads, page_size, head_dim, update_block_d,
                 num_warps=2, num_stages=3,
             )
+
+        if use_fused:
+            counters = _get_counters(q.device, programs)
+            _paged_attn_decode_fused_kernel[(programs, num_splits)](
+                q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
+                counters,
+                split_len, num_pages_per_seq, num_splits,
+                q_len, kv_append_len, n_q_heads, n_kv_heads,
+                page_size, head_dim, float(softmax_scale),
+                bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
+                block_m, block_h, block_rows, block_n,
+                num_warps=8, num_stages=3,
+            )
+            return out
 
         _paged_attn_decode_split_kernel[(programs, num_splits)](
             q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
@@ -1191,10 +1368,24 @@ def paged_attn_triton_decode(
         )
 
         if num_splits > 1:
-            _paged_attn_decode_combine_kernel[(programs,)](
+            # The one-program-per-(batch, kv_head, h_block) grid is tiny at decode
+            # (4 programs here) and the partial readback runs latency-bound; split
+            # the row axis across programs instead. Per-element split-sum order is
+            # unchanged, so results are bit-identical.
+            if _paged_fused and programs * block_rows <= 64:
+                # tiny grid (decode): the partial readback runs latency-bound,
+                # so split the row axis across programs. Per-element split-sum
+                # order is unchanged, so results are bit-identical.
+                rows_per_prog = max(block_rows // 4, 1)
+                row_progs = triton.cdiv(block_rows, rows_per_prog)
+            else:
+                rows_per_prog = 0
+                row_progs = 1
+            _paged_attn_decode_combine_kernel[(programs, row_progs)](
                 partial_o, partial_ml, out, h32,
                 num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim,
                 block_m, block_h, block_rows,
+                ROWS_PER_PROG=rows_per_prog,
                 num_warps=4, num_stages=1,
             )
     return out
