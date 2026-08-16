@@ -173,17 +173,16 @@ class LinearEXL3:
         # Use the Triton op when the BC kernel is unavailable (e.g. ROCm).
         # The kernels live on the triton-kernels line; without them fall
         # through to reconstruct_hgemm so this line stays valid standalone.
+        # (linear_exl3_triton is the module-level import; a local import here
+        # would shadow it for the whole function scope.)
         if self.bc is None:
-            try:
-                from .exl3_triton import linear_exl3_triton
+            if has_triton:
                 return linear_exl3_triton(
                     x, self.trellis, self.suh, self.svh, self.K,
                     self.mcg, self.mul1, self.in_features, self.out_features,
                     self.trellis.device, out_dtype or self.default_out_dtype,
                     self.bias,
                 )
-            except ImportError:
-                pass
 
         return self.reconstruct_hgemm(x, out_dtype)
 
