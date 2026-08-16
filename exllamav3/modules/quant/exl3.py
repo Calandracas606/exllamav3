@@ -156,7 +156,6 @@ class LinearEXL3:
                     )
                 except ImportError:
                     pass
-
             if use_triton:
                 dtype = out_dtype or self.default_out_dtype
                 return linear_exl3_triton(

@@ -135,6 +135,60 @@ def test_linear_vs_reference_all_k(in_features, out_features, K, mcg, mul1):
     assert _rel_err(y, y_ref) < 2e-2
 
 
+# Shapes whose K/N are NOT multiples of 128: the fused kernel's fast decode
+# requires full tiles, so these exercise the generic staged-row gather path
+# (in particular the K=7 window table and the K=1 decode there). The Hadamard
+# wrappers (C++ and Triton) require 128-divisible dimensions, so this tests
+# the fused GEMM kernel directly on pre-transformed input; the reference
+# weight matrix comes from the C++ reconstruct on zero-padded trellis tiles.
+NONDIV_SHAPES = [
+    (4112, 384),   # K % 128 == 16
+    (4096, 4112),  # N % 128 == 16
+]
+
+
+@pytest.mark.parametrize("mcg,mul1", [(False, False), (True, True)])
+@pytest.mark.parametrize("K", [1, 2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("in_features,out_features", NONDIV_SHAPES)
+@pytest.mark.parametrize("rows", [1, 17])
+def test_gemm_generic_path_all_k(in_features, out_features, K, mcg, mul1, rows):
+    from exllamav3.modules.quant.exl3_triton import (
+        _decode_lut, _get_perm, exl3_gemm_triton,
+    )
+
+    dev = device()
+    torch.manual_seed(in_features + out_features * 3 + K * 11 + rows)
+    trellis = make_trellis(in_features, out_features, K, dev)
+    xh = torch.randn(rows, in_features, dtype=torch.half, device=dev) * 0.1
+
+    # reference: reconstruct on zero-padded (128-divisible) trellis, then slice
+    in_pad = (in_features + 127) // 128 * 128
+    out_pad = (out_features + 127) // 128 * 128
+    trellis_pad = torch.cat([
+        trellis,
+        torch.zeros(in_pad // 16 - trellis.shape[0], trellis.shape[1],
+                    trellis.shape[2], dtype=trellis.dtype, device=dev),
+    ], dim=0)
+    trellis_pad = torch.cat([
+        trellis_pad,
+        torch.zeros(trellis_pad.shape[0], out_pad // 16 - trellis_pad.shape[1],
+                    trellis_pad.shape[2], dtype=trellis.dtype, device=dev),
+    ], dim=1)
+    w = torch.empty((in_pad, out_pad), dtype=torch.half, device=dev)
+    ext.reconstruct(w, trellis_pad, K, mcg, mul1)
+    w = w[:in_features, :out_features].contiguous()
+
+    y_ref = torch.empty((rows, out_features), dtype=torch.half, device=dev)
+    ext.hgemm(xh, w, y_ref)
+
+    y = torch.empty((rows, out_features), dtype=torch.half, device=dev)
+    exl3_gemm_triton(
+        xh, trellis, y, _decode_lut(1 if mcg else (2 if mul1 else 0), dev),
+        _get_perm(dev), K, trellis.shape[1], 1 if mcg else (2 if mul1 else 0),
+    )
+    assert _rel_err(y, y_ref) < 2e-2
+
+
 @pytest.mark.parametrize("rows", ROWS)
 @pytest.mark.parametrize("mcg,mul1", [(False, False), (True, True)])
 @pytest.mark.parametrize("in_features,out_features,K", SHAPES[:4])

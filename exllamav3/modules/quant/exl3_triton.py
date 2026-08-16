@@ -16,12 +16,12 @@ on the decode path):
                                              # (+ optional bias)
 
 The fused kernel decodes the EXL3 trellis tile-by-tile inside the K-loop
-without materializing the weight matrix. Bits 2-6 and 8 use a gather-free
-algebraic decode (the per-element word/shift lookup reduces to per-axis bit
-fields, so packed rows load as linear u32 vectors and the subtile permutation
-is realized by static reshapes). The remaining widths (K = 1, 7) hit a
-degeneracy in that algebra and are routed to the C++ reconstruct + hgemm
-pipeline instead (see ``linear_exl3_triton``).
+without materializing the weight matrix. Every bit width K = 1..8 has a
+dedicated M==1 fast decode whose per-element word/shift lookup is realized
+without data-dependent gathers (linear/affine u32 row loads + static-reshape
+permutations, or per-(row, c>>3) constexpr window offsets for the odd
+widths), so packed rows load as linear u32 vectors. Non-divisible shapes
+fall back to a generic staged-row tl.gather decode that covers all widths.
 """
 from __future__ import annotations
 
@@ -234,6 +234,37 @@ def _get_perm(device):
 _DQ_CACHE = {}
 _LUT_CACHE = {}
 
+# Per-row window offsets for the odd bit widths (K = 3, 5, 7).
+#
+# For those widths the per-element (word, shift) lookup does not factor into
+# independent per-axis bit fields (the window end falls inside a code, so the
+# word index and the funnel shift carry into each other). Instead each of the
+# 32 (r, c//8) combinations of a 16x16 sub-tile has one fixed window offset
+# D(r, c3) = 32*f + sh: element (r, c) reads the 16-bit code window starting
+# at stream bit 32*(K_BITS*(c%8) + f) + sh, i.e. word (K_BITS*(c%8) + f) of
+# the subtile at funnel shift sh (neighbor word -1 when sh > 16). These
+# tables were recovered element-exactly from the C++ reconstruct kernel by
+# differential probing and verified to reproduce its output bit-for-bit.
+_M_ROW_OFFSETS = {
+    3: [29, 17, 26, 14, 5, 57, 2, 54, 45, 33, 42, 94, 85, 73, 82, 70,
+        23, 11, 20, 8, 63, 51, 60, 48, 39, 91, 36, 88, 79, 67, 76, 64],
+    5: [27, 7, 22, 2, 51, 95, 46, 90, 75, 119, 70, 114, 99, 143, 158, 138,
+        17, 61, 12, 56, 41, 85, 36, 80, 65, 109, 124, 104, 153, 133, 148, 128],
+    7: [25, 61, 18, 54, 33, 69, 90, 126, 105, 141, 98, 134, 177, 213, 170, 206,
+        11, 47, 4, 40, 83, 119, 76, 112, 155, 191, 148, 184, 163, 199, 220, 192],
+}
+_M_ROW_CACHE = {}
+
+
+def _get_m_row_offsets(K_bits: int, device) -> torch.Tensor:
+    key = (K_bits, str(device))
+    if key not in _M_ROW_CACHE:
+        _M_ROW_CACHE[key] = torch.tensor(
+            _M_ROW_OFFSETS[K_bits], device=device, dtype=torch.int32
+        )
+    return _M_ROW_CACHE[key]
+
+
 def _decode_lut(cb: int, device) -> torch.Tensor:
     key = (cb, str(device))
     if key not in _LUT_CACHE:
@@ -279,17 +310,22 @@ def _decode_lut(cb: int, device) -> torch.Tensor:
 # fetched with linear, dword-vectorized u32 loads (128 B per sub-tile row,
 # contiguous in the trellis), never scattered scalar gathers.
 #
-# bits=4 fast path: the 16x16 sub-tile permutation factors into per-axis
-# index bits, so decoding the full [8 shift, 32 word] code table computes
-# every weight exactly once with NO data-dependent gather; the permutation
-# is realized by static reshape/permute (tensor-core path) or folded into a
-# broadcast pattern of the x vector (M==1 GEMV path). For M == 1 the decoded
-# tile is reduced in fp32 with the product tile accumulated elementwise over
-# the whole K loop, so the k-loop issues no cross-lane reductions; the
-# result is summed once per block at the end.
+# Fast paths (full tiles): every bit width decodes the full [shift, word]
+# code table with NO data-dependent gather, so each sub-tile weight is
+# computed exactly once:
+# - K = 1/2/4/8: the 16x16 sub-tile permutation factors into per-axis index
+#   bits (see the kernel branches), realized by static reshape/permute
+#   (tensor-core path) or folded into a broadcast pattern of the x vector
+#   (M==1 GEMV path).
+# - K = 3/5/7: per-(row, c>>3) window-offset tables (_M_ROW_OFFSETS) with
+#   affine word-slice loads.
+# - K = 6: four word-slice loads + the _funnel6 word-pair decode.
+# For M == 1 the decoded tile is reduced in fp32 with the product tile
+# accumulated elementwise over the whole K loop, so the k-loop issues no
+# cross-lane reductions; the result is summed once per block at the end.
 #
-# Generic path (other bit widths): staged row load + tl.gather decode, which
-# lowers to LDS (shared-memory) reads.
+# Generic path (non-divisible tiles): staged row load + tl.gather decode,
+# which lowers to LDS (shared-memory) reads.
 # ---------------------------------------------------------------------------
 
 
@@ -297,13 +333,27 @@ def _exl3_gemm_early_prune(configs, named_args, **kwargs):
     """Restrict the config set per invocation:
     - Other bit widths run the generic tl.gather path, where this Triton
       build's LLVM aborts on large gather tiles.
-    - bits=4/6 shapes whose N/K are not divisible by a config's tile fall back
-      to the generic path too, so apply the same cap there.
-    The gather-free bits=4 and bits=6 fast paths handle the large tiles."""
+    - Shapes whose N/K are not divisible by a config's tile fall back to the
+      generic path too, so apply the same cap there.
+    - M == 1 never benefits from BLOCK_M > 16 (the grid is a single block and
+      the GEMV branch ignores BLOCK_M); pruning them also works around Triton
+      compile failures for some narrow-BLOCK_N decode tiles at high warp
+      counts.
+    Every bit width has a gather-free fast path that handles the large tiles."""
     bits = kwargs.get("K_BITS", named_args.get("K_BITS"))
     n = kwargs.get("N", named_args.get("N"))
     k = kwargs.get("K_dim", named_args.get("K_dim"))
-    fast_ok = bits in (4, 6) and n % 128 == 0 and k % 128 == 0
+    m = kwargs.get("M", named_args.get("M"))
+    fast_ok = n % 128 == 0 and k % 128 == 0
+    if bits == 1:
+        # This Triton build's TTGIR pass crashes on the K_BITS=1 decode tiles
+        # ([*, 8] per sub-tile) with 8 warps at BLOCK_N=16.
+        configs = [c for c in configs if not (c.num_warps >= 8 and c.kwargs["BLOCK_N"] <= 16)]
+    if m == 1:
+        out = [c for c in configs if c.kwargs["BLOCK_M"] == 16]
+        if not fast_ok:
+            out = [c for c in out if c.kwargs["BLOCK_N"] <= 64 and c.kwargs["BLOCK_K"] <= 64]
+        return out if out else configs
     if not fast_ok:
         small = [c for c in configs if c.kwargs["BLOCK_N"] <= 64 and c.kwargs["BLOCK_K"] <= 64]
         return small if small else configs
@@ -424,6 +474,7 @@ def _fused_dequant_gemm_kernel(
     x_ptr, y_ptr,
     trellis_ptr,
     perm_i_ptr,
+    mrow_ptr,
     M, N, K_dim,
     stride_xm, stride_xk,
     stride_tk, stride_tn,
@@ -691,6 +742,191 @@ def _fused_dequant_gemm_kernel(
                 acc.to(y_ptr.dtype.element_ty),
                 mask=mask_m[:, None] & mask_n[None, :],
             )
+    elif (K_BITS == 1 or K_BITS == 2 or K_BITS == 8) and (N % BLOCK_N == 0) and (K_dim % BLOCK_K == 0):
+        # ------------------------------------------------------------------
+        # Power-of-two widths (K = 1, 2, 8): same gather-free structure as
+        # the bits=4 path, generalized. The (r, c) -> (word, shift) lookup is
+        # a pure bit-field map: with r = 8*r3 + 4*r2 + 2*r1 + r0 and
+        # c = 8*c3 + cl (cl = c%8), the 5 bits (r2, r1, c3, r3, r0) split —
+        # the first log2(K_BITS) of them pack into the sub-tile word index
+        #   word = K_BITS*cl + g,      g = (r2, r1, c3)[:log2(K)] packed MSB-first
+        # and the remaining bits form the shift row
+        #   row  = the (5 - log2(K)) remaining bits, MSB-first
+        #   shift(row) = 32 - K_BITS - K_BITS*row
+        # (verified element-exactly against the C++ reconstruct kernel; the
+        # K_BITS == 4 case is the branch above). Every (row, word) pair is one
+        # sub-tile element exactly once, so like bits=4 the packed row loads
+        # linear and the permutation is realized by static reshapes; the m1
+        # neighbor word (needed when shift > 16) is the row shifted one word
+        # back, wrapped inside the sub-tile in registers.
+        # ------------------------------------------------------------------
+        ROWS: tl.constexpr = 32 // K_BITS
+        rows = tl.arange(0, ROWS)
+        sh = (32 - K_BITS) - K_BITS * rows
+        neg_sh = tl.minimum(32 - sh, 31)
+        wc = tl.arange(0, NN * N_U32)
+
+        if M1:
+            # GEMV: fold the permutation into the x broadcast (see bits=4).
+            r16 = tl.arange(0, 16)
+            if K_BITS == 1:
+                acc7 = tl.zeros((2, 2, 2, 2, 2, NN, 8), dtype=tl.float32)  # (r2,r1,c3,r3,r0,nj,cl)
+            elif K_BITS == 2:
+                acc7 = tl.zeros((2, 2, 2, 2, NN, 8, 2), dtype=tl.float32)  # (r1,c3,r3,r0,nj,cl,r2)
+            else:
+                acc7 = tl.zeros((2, 2, NN, 8, 2, 2, 2), dtype=tl.float32)  # (r3,r0,nj,cl,r2,r1,c3)
+            for k_outer in range(n_outer):
+                for ki in tl.static_range(NK):
+                    ktb = k_outer * NK + ki
+                    row = tu32_ptr + ktb * stride_tk_u32 + base_n
+                    words = tl.load(row + wc)
+                    safe = (ktb > 0) | (base_n > 0)
+                    m1_lin = tl.load(row + wc - 1, mask=safe | (wc > 0), other=0)
+                    wlast = tl.load(row + (wc // N_U32) * N_U32 + (N_U32 - 1))
+                    m1 = tl.where((wc % N_U32) == 0, wlast, m1_lin)
+                    q = ((words[None, :] >> sh[:, None]) |
+                         (m1[None, :] << neg_sh[:, None])) & 0xFFFF     # [ROWS, NN*N]
+                    w_dec = _decode_u16(q.to(tl.uint32), CB).to(tl.float32)
+                    xk = tl.load(x_ptr + (ktb * 16 + r16) * stride_xk).to(tl.float32)
+                    if K_BITS == 1:
+                        # r = 8*r3 + 4*r2 + 2*r1 + r0
+                        xpat = tl.permute(tl.reshape(xk, (2, 2, 2, 2)), (1, 2, 0, 3))
+                        xb = tl.broadcast_to(
+                            tl.reshape(xpat, (2, 2, 1, 2, 2, 1, 1)), (2, 2, 2, 2, 2, NN, 8)
+                        )
+                        acc7 += tl.reshape(w_dec, (2, 2, 2, 2, 2, NN, 8)) * xb
+                    elif K_BITS == 2:
+                        xpat = tl.permute(tl.reshape(xk, (2, 2, 2, 2)), (2, 0, 3, 1))
+                        xb = tl.broadcast_to(
+                            tl.reshape(xpat, (2, 1, 2, 2, 1, 1, 2)), (2, 2, 2, 2, NN, 8, 2)
+                        )
+                        acc7 += tl.reshape(w_dec, (2, 2, 2, 2, NN, 8, 2)) * xb
+                    else:
+                        xpat = tl.permute(tl.reshape(xk, (2, 2, 2, 2)), (0, 3, 1, 2))
+                        xb = tl.broadcast_to(
+                            tl.reshape(xpat, (2, 2, 1, 1, 2, 2, 1)), (2, 2, NN, 8, 2, 2, 2)
+                        )
+                        acc7 += tl.reshape(w_dec, (2, 2, NN, 8, 2, 2, 2)) * xb
+            if K_BITS == 1:
+                s = tl.sum(tl.sum(tl.sum(tl.sum(acc7, 0), 0), 1), 1)     # -> (c3, nj, cl)
+            elif K_BITS == 2:
+                s = tl.sum(tl.sum(tl.sum(tl.sum(acc7, 0), 1), 1), 3)     # -> (c3, nj, cl)
+            else:
+                s = tl.sum(tl.sum(tl.sum(tl.sum(acc7, 0), 0), 2), 2)     # -> (nj, cl, c3)
+                s = tl.permute(s, (0, 2, 1))
+            acc = tl.reshape(tl.permute(s, (1, 0, 2)), (BLOCK_N,))       # n = 16*nj + 8*c3 + cl
+            tl.store(y_ptr + offs_n * stride_yn, acc.to(y_ptr.dtype.element_ty), mask=mask_n)
+        else:
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for k_outer in range(n_outer):
+                for ki in tl.static_range(NK):
+                    ktb = k_outer * NK + ki
+                    row = tu32_ptr + ktb * stride_tk_u32 + base_n
+                    words = tl.load(row + wc)
+                    safe = (ktb > 0) | (base_n > 0)
+                    m1_lin = tl.load(row + wc - 1, mask=safe | (wc > 0), other=0)
+                    wlast = tl.load(row + (wc // N_U32) * N_U32 + (N_U32 - 1))
+                    m1 = tl.where((wc % N_U32) == 0, wlast, m1_lin)
+                    q = ((words[None, :] >> sh[:, None]) |
+                         (m1[None, :] << neg_sh[:, None])) & 0xFFFF
+                    w = _decode_u16(q.to(tl.uint32), CB)
+                    # static reorder (row bits, word bits) -> (r, c)
+                    if K_BITS == 1:
+                        w = tl.reshape(w, (2, 2, 2, 2, 2, NN, 8))        # (r2,r1,c3,r3,r0,nj,cl)
+                        w = tl.permute(w, (3, 0, 1, 4, 5, 2, 6))         # (r3,r2,r1,r0,nj,c3,cl)
+                    elif K_BITS == 2:
+                        w = tl.reshape(w, (2, 2, 2, 2, NN, 8, 2))        # (r1,c3,r3,r0,nj,cl,r2)
+                        w = tl.permute(w, (2, 6, 0, 3, 4, 1, 5))         # (r3,r2,r1,r0,nj,c3,cl)
+                    else:
+                        w = tl.reshape(w, (2, 2, NN, 8, 2, 2, 2))        # (r3,r0,nj,cl,r2,r1,c3)
+                        w = tl.permute(w, (0, 4, 5, 1, 2, 6, 3))         # (r3,r2,r1,r0,nj,c3,cl)
+                    w = tl.reshape(w, (16, BLOCK_N))
+                    k_off = ktb * 16 + tl.arange(0, 16)
+                    x_block = tl.load(
+                        x_ptr + offs_m[:, None] * stride_xm + k_off[None, :] * stride_xk,
+                        mask=mask_m[:, None],
+                        other=0.0,
+                    )
+                    acc = tl.dot(x_block, w, acc)
+            tl.store(
+                y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+                acc.to(y_ptr.dtype.element_ty),
+                mask=mask_m[:, None] & mask_n[None, :],
+            )
+    elif (K_BITS == 3 or K_BITS == 5 or K_BITS == 7) and (N % BLOCK_N == 0) and (K_dim % BLOCK_K == 0):
+        # ------------------------------------------------------------------
+        # Odd widths (K = 3, 5, 7): the (word, shift) lookup does not factor
+        # into independent per-axis bit fields (the 16-bit decode window ends
+        # inside a code, so word index and shift carry into each other).
+        # Instead, each of the 32 (r, c3) rows of a sub-tile has ONE fixed
+        # window offset D = 32*f + sh (see _M_ROW_OFFSETS): element (r, c)
+        # reads word K_BITS*(c%8) + f(r, c//8) at funnel shift sh(r, c//8),
+        # neighbor word -1 when sh > 16. The decode tile is [32 rows,
+        # NN*8 (c%8)] with affine word addresses (stride K_BITS in the
+        # column axis, constant row offset), so there is still no
+        # data-dependent gather; every word of the sub-tile is used exactly
+        # once per f-slice.
+        # ------------------------------------------------------------------
+        r16 = tl.arange(0, 16)
+        mrow = tl.arange(0, 32)                     # row = 2*r + c3
+        D_vec = tl.load(mrow_ptr + mrow)
+        f_vec = D_vec // 32
+        sh_vec = D_vec % 32
+        neg_vec = tl.minimum(32 - sh_vec, 31)
+        col = tl.arange(0, NN * 8)
+        njc = col // 8
+        clc = col % 8
+        w_lo = njc[None, :] * N_U32 + K_BITS * clc[None, :] + f_vec[:, None]
+        t_hi = K_BITS * clc[None, :] + f_vec[:, None] - 1
+        w_hi = njc[None, :] * N_U32 + (t_hi + N_U32) % N_U32
+
+        if M1:
+            accm = tl.zeros((32, NN * 8), dtype=tl.float32)
+            for k_outer in range(n_outer):
+                for ki in tl.static_range(NK):
+                    ktb = k_outer * NK + ki
+                    row = tu32_ptr + ktb * stride_tk_u32 + base_n
+                    lo = tl.load(row + w_lo)                       # [32, NN*8]
+                    hi = tl.load(row + w_hi)
+                    q = ((lo >> sh_vec[:, None]) |
+                         (hi << neg_vec[:, None])) & 0xFFFF
+                    w_dec = _decode_u16(q.to(tl.uint32), CB).to(tl.float32)
+                    xk = tl.load(x_ptr + (ktb * 16 + r16) * stride_xk).to(tl.float32)
+                    xb = tl.reshape(
+                        tl.broadcast_to(tl.reshape(xk, (16, 1, 1, 1)), (16, 2, NN, 8)),
+                        (32, NN * 8),
+                    )
+                    accm += w_dec * xb
+            # (r, c3, nj, cl) -> sum over r -> (c3, nj, cl) -> n = 16*nj + 8*c3 + cl
+            s = tl.sum(tl.reshape(accm, (16, 2, NN, 8)), 0)
+            acc = tl.reshape(tl.permute(s, (1, 0, 2)), (BLOCK_N,))
+            tl.store(y_ptr + offs_n * stride_yn, acc.to(y_ptr.dtype.element_ty), mask=mask_n)
+        else:
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for k_outer in range(n_outer):
+                for ki in tl.static_range(NK):
+                    ktb = k_outer * NK + ki
+                    row = tu32_ptr + ktb * stride_tk_u32 + base_n
+                    lo = tl.load(row + w_lo)
+                    hi = tl.load(row + w_hi)
+                    q = ((lo >> sh_vec[:, None]) |
+                         (hi << neg_vec[:, None])) & 0xFFFF
+                    w = _decode_u16(q.to(tl.uint32), CB)
+                    # (r, c3, nj, cl) -> (r, nj, c3, cl) -> [16, BLOCK_N]
+                    w = tl.permute(tl.reshape(w, (16, 2, NN, 8)), (0, 2, 1, 3))
+                    w = tl.reshape(w, (16, BLOCK_N))
+                    k_off = ktb * 16 + tl.arange(0, 16)
+                    x_block = tl.load(
+                        x_ptr + offs_m[:, None] * stride_xm + k_off[None, :] * stride_xk,
+                        mask=mask_m[:, None],
+                        other=0.0,
+                    )
+                    acc = tl.dot(x_block, w, acc)
+            tl.store(
+                y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+                acc.to(y_ptr.dtype.element_ty),
+                mask=mask_m[:, None] & mask_n[None, :],
+            )
     else:
         # ------------------------------------------------------------------
         # Generic path (other bit widths / non-full tiles): staged row load +
@@ -740,6 +976,16 @@ def _fused_dequant_gemm_kernel(
             word_low_idx = i2 % N_U32
             word_high_idx = i0 % N_U32
             shift = s2 + (7 - r) * K_BITS
+        elif K_BITS == 7:
+            # dq2x2 widths: the C++ decode pairs consecutive codes across the
+            # word boundary, so the per-element window does not follow the
+            # t_offset/j algebra of the dq4 widths. Use the verified per-row
+            # window offsets (same tables as the odd-width fast path).
+            row = r16[:, None] * 2 + ((n_idx[None, :] % 16) // 8)
+            d = tl.load(mrow_ptr + row)
+            word_low_idx = K_BITS * (n_idx[None, :] % 8) + d // 32
+            word_high_idx = (word_low_idx - 1 + N_U32) % N_U32
+            shift = d % 32
         else:
             t = (elem_idx // 4) * 4
             j = elem_idx % 4
@@ -837,6 +1083,7 @@ def exl3_gemm_triton(
         x, y,
         trellis,
         perm_i,
+        _get_m_row_offsets(K_bits, x.device) if K_bits in _M_ROW_OFFSETS else perm_i,
         M, N, K_dim,
         x.stride(0), x.stride(1),
         trellis.stride(0), trellis.stride(1),
@@ -894,13 +1141,6 @@ def _linear_exl3_triton(
         y.add_(bias)
 
 
-# Bit widths the fused Triton kernel covers. K = 1 and 7 degenerate in the
-# decode algebra (the per-axis bit-field split of the word/shift lookup no
-# longer lines up with the 16-element subtile packing) and produce wrong
-# results; those widths are routed to the C++ pipeline by linear_exl3_triton.
-_TRITON_K_SUPPORTED = {2, 3, 4, 5, 6, 8}
-
-
 def linear_exl3_triton(
     x: torch.Tensor,
     trellis: torch.Tensor,
@@ -921,6 +1161,9 @@ def linear_exl3_triton(
     graph-capturing paths (BC) call the preallocated-buffer function directly
     to keep tensor addresses stable across replays.
 
+    All bit widths K = 1..8 are decoded in-kernel (fast gather-free paths for
+    full tiles, a staged-row gather path for the rest).
+
     The per-call ``xh`` workspace allocation is deliberate and cheap: the
     caching allocator serves it from its free list (no cudaMalloc, no sync)
     after the first few calls, and this wrapper is off the decode hot path —
@@ -931,21 +1174,6 @@ def linear_exl3_triton(
     rows = x_flat.shape[0]
 
     x_half = x_flat if x_flat.dtype == torch.half else x_flat.to(torch.half)
-
-    if K not in _TRITON_K_SUPPORTED:
-        # Unsupported width: C++ reconstruct + hgemm pipeline
-        from ...ext import exllamav3_ext as _ext
-        xh = torch.empty_like(x_half)
-        _ext.had_r_128(x_half, xh, suh, None, 1.0)
-        w = torch.empty((in_features, out_features), dtype=torch.half, device=device)
-        _ext.reconstruct(w, trellis, K, mcg, mul1)
-        y = torch.empty((rows, out_features), dtype=torch.half, device=device)
-        _ext.hgemm(xh, w, y)
-        _ext.had_r_128(y, y, None, svh, 1.0)
-        if bias is not None:
-            y = y + bias
-        y = y if out_dtype == torch.half else y.to(out_dtype)
-        return y.view(original_shape[:-1] + (out_features,))
 
     y = torch.empty((rows, out_features), dtype=out_dtype, device=device)
     xh = torch.empty_like(x_half)
