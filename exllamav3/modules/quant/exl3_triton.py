@@ -351,6 +351,17 @@ def _exl3_gemm_early_prune(configs, named_args, **kwargs):
         configs = [c for c in configs if not (c.num_warps >= 8 and c.kwargs["BLOCK_N"] <= 16)]
     if m == 1:
         out = [c for c in configs if c.kwargs["BLOCK_M"] == 16]
+        if bits != 3:
+            # The BLOCK_N=32/K=32 pair exists only for the bits=3 M1 run-funnel
+            # decode; other widths never see it (identical autotune behaviour
+            # to before it was added).
+            out = [c for c in out if not (c.kwargs["BLOCK_N"] == 32 and c.kwargs["BLOCK_K"] == 32)]
+        else:
+            # bits=3 run-funnel decode: BLOCK_N=128 tiles collapse to the old
+            # per-code path's rate (measured 229 GB/s at 1x5120x248320 vs 477+
+            # for the narrow tiles), so keep the M1 list tight enough that a
+            # cold-clock autotune pass cannot lock one in.
+            out = [c for c in out if c.kwargs["BLOCK_N"] != 128]
         if not fast_ok:
             out = [c for c in out if c.kwargs["BLOCK_N"] <= 64 and c.kwargs["BLOCK_K"] <= 64]
         return out if out else configs
@@ -386,6 +397,12 @@ def _exl3_gemm_configs():
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_M": 1}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 1}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 1}, num_warps=8, num_stages=3),
+        # M == 1, bits=3 run-funnel decode: the shared-funnel tile is narrow
+        # (8 x BLOCK_N/2), so single-warp narrow blocks win the wide-N stream
+        # (measured 484 vs 431 GB/s at 1x5120x248320). Pruned out for every
+        # other invocation by _exl3_gemm_early_prune.
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 32, "GROUP_M": 1}, num_warps=1, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 32, "GROUP_M": 1}, num_warps=2, num_stages=3),
         # Generic path (other bit widths) and small shapes
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 64, "GROUP_M": 1}, num_warps=4, num_stages=3),
         # M > 1 (prefill)
@@ -853,7 +870,97 @@ def _fused_dequant_gemm_kernel(
                 acc.to(y_ptr.dtype.element_ty),
                 mask=mask_m[:, None] & mask_n[None, :],
             )
-    elif (K_BITS == 3 or K_BITS == 5 or K_BITS == 7) and (N % BLOCK_N == 0) and (K_dim % BLOCK_K == 0):
+    elif K_BITS == 3 and (N % BLOCK_N == 0) and (K_dim % BLOCK_K == 0):
+        # ------------------------------------------------------------------
+        # bits=3 fast path (full tiles only). The D-table rows regroup into 8
+        # run-groups g = 2v + c3 (rows r = 2v + 8q + p, m = 2q + p) whose four
+        # 16-bit windows are consecutive 3-bit steps of ONE 32-bit funnel
+        # Q_g = (W[a_g] >> b_g) | (W[a_g - 1] << (32 - b_g)) of subtile words
+        # (word indices mod 24; b_g = (84 - 12*g) % 32, a_g = g // 4),
+        # window(g, m) = (Q_g >> (9 - 3*m)) & 0xFFFF. Verified bit-exact
+        # against the D-table decode. Two strided u32 slice loads (the g/4
+        # word and its -1 neighbor, stride 3 over the 24-word subtile) feed
+        # all eight funnels, so each weight costs one load-lane instead of
+        # two and one funnel instead of four.
+        # ------------------------------------------------------------------
+        r16 = tl.arange(0, 16)
+        g8 = tl.arange(0, 8)
+        col = tl.arange(0, NN * 8)
+        njc = col // 8
+        clc = col % 8
+        base_n3 = (pid_n * NN) * stride_tn_u32
+
+        base_g = (84 - 12 * g8) % 32
+        neg_g = tl.minimum(32 - base_g, 31)
+        a_g = 2 - (84 - 12 * g8) // 32
+        w_a = njc[None, :] * N_U32 + 3 * clc[None, :] + a_g[:, None]
+        w_b = njc[None, :] * N_U32 + (3 * clc[None, :] + a_g[:, None] + N_U32 - 1) % N_U32
+
+        if M1:
+            # acc[g, nj*8 + clc]; each of the 4 rows of a group accumulates
+            # into the shared (g, column) slot with its own x element.
+            acc8 = tl.zeros((8, NN * 8), dtype=tl.float32)
+            for k_outer in range(n_outer):
+                for ki in tl.static_range(NK):
+                    ktb = k_outer * NK + ki
+                    row = tu32_ptr + ktb * stride_tk_u32 + base_n3
+                    A = tl.load(row + w_a)
+                    B = tl.load(row + w_b)
+                    # no 32-bit mask on Q: the extraction masks drop every bit
+                    # above 24, including the bit-31 pollution B<<31 at base 0
+                    Q = (A >> base_g[:, None]) | (B << neg_g[:, None])
+                    xk = tl.load(x_ptr + (ktb * 16 + r16) * stride_xk).to(tl.float32)
+                    # X_m[g] = xk[2*(g//2) + 8*(m//2) + m%2]: pairs (e, o) of
+                    # the rows xk[2i+p], then halves v<4 / v>=4, interleaved
+                    # over c3 by the final (4, 2) -> 8 broadcast.
+                    e, o = tl.split(tl.reshape(xk, (8, 2)))
+                    e_lo, e_hi = tl.split(tl.permute(tl.reshape(e, (2, 4)), (1, 0)))
+                    o_lo, o_hi = tl.split(tl.permute(tl.reshape(o, (2, 4)), (1, 0)))
+                    x_m0 = tl.broadcast_to(tl.reshape(tl.broadcast_to(e_lo[:, None], (4, 2)), (8,))[:, None], (8, NN * 8))
+                    x_m1 = tl.broadcast_to(tl.reshape(tl.broadcast_to(o_lo[:, None], (4, 2)), (8,))[:, None], (8, NN * 8))
+                    x_m2 = tl.broadcast_to(tl.reshape(tl.broadcast_to(e_hi[:, None], (4, 2)), (8,))[:, None], (8, NN * 8))
+                    x_m3 = tl.broadcast_to(tl.reshape(tl.broadcast_to(o_hi[:, None], (4, 2)), (8,))[:, None], (8, NN * 8))
+                    acc8 += (
+                        _decode_u16(((Q >> 9) & 0xFFFF).to(tl.uint32), CB).to(tl.float32) * x_m0
+                        + _decode_u16(((Q >> 6) & 0xFFFF).to(tl.uint32), CB).to(tl.float32) * x_m1
+                        + _decode_u16(((Q >> 3) & 0xFFFF).to(tl.uint32), CB).to(tl.float32) * x_m2
+                        + _decode_u16((Q & 0xFFFF).to(tl.uint32), CB).to(tl.float32) * x_m3
+                    )
+            # (v, c3, nj, clc) -> sum v -> n = 16*nj + 8*c3 + clc
+            s = tl.sum(tl.reshape(acc8, (4, 2, NN, 8)), 0)   # (c3, nj, clc)
+            acc = tl.reshape(tl.permute(s, (1, 0, 2)), (BLOCK_N,))
+            tl.store(y_ptr + offs_n * stride_yn, acc.to(y_ptr.dtype.element_ty), mask=mask_n)
+        else:
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for k_outer in range(n_outer):
+                for ki in tl.static_range(NK):
+                    ktb = k_outer * NK + ki
+                    row = tu32_ptr + ktb * stride_tk_u32 + base_n3
+                    A = tl.load(row + w_a)
+                    B = tl.load(row + w_b)
+                    Q = (A >> base_g[:, None]) | (B << neg_g[:, None])
+                    # (v, c3, nj, clc, p, q) -> (r = 8q + 2v + p, n = 16*nj +
+                    # 8*c3 + clc) with m = 2q + p
+                    q0 = tl.reshape((Q >> 9) & 0xFFFF, (4, 2, NN, 8))
+                    q1 = tl.reshape((Q >> 6) & 0xFFFF, (4, 2, NN, 8))
+                    q2 = tl.reshape((Q >> 3) & 0xFFFF, (4, 2, NN, 8))
+                    q3 = tl.reshape(Q & 0xFFFF, (4, 2, NN, 8))
+                    wq = tl.join(tl.join(q0, q1), tl.join(q2, q3))
+                    wq = tl.permute(wq, (5, 0, 4, 2, 1, 3)).reshape(16, BLOCK_N)
+                    w = _decode_u16(wq.to(tl.uint32), CB)
+                    k_off = ktb * 16 + tl.arange(0, 16)
+                    x_block = tl.load(
+                        x_ptr + offs_m[:, None] * stride_xm + k_off[None, :] * stride_xk,
+                        mask=mask_m[:, None],
+                        other=0.0,
+                    )
+                    acc = tl.dot(x_block, w, acc)
+            tl.store(
+                y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+                acc.to(y_ptr.dtype.element_ty),
+                mask=mask_m[:, None] & mask_n[None, :],
+            )
+    elif (K_BITS == 5 or K_BITS == 7) and (N % BLOCK_N == 0) and (K_dim % BLOCK_K == 0):
         # ------------------------------------------------------------------
         # Odd widths (K = 3, 5, 7): the (word, shift) lookup does not factor
         # into independent per-axis bit fields (the 16-bit decode window ends
