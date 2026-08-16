@@ -1,5 +1,8 @@
 
-# <img src="doc/cat.png" width="40"> ExLlamaV3
+# <img src="doc/cat.png" width="40"> ExLlamaV3 (ROCm fork — Calandracas606)
+
+> **This is the ROCm/gfx1100 fork of ExLlamaV3.** See **[Branch structure](#branch-structure-roc-fm-fork)**
+> below for how this repository is organized; the upstream README follows.
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs. Headline features:
 
@@ -15,6 +18,55 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
 - LoRA support
 
 The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://github.com/theroyallab/tabbyAPI/), which provides an OpenAI-compatible API for local or remote inference, with extended features like HF model downloading, embedding model support and support for HF Jinja2 chat templates.
+
+## Branch structure (ROCm fork)
+
+This fork is organized as **two independent lines stacked on upstream `dev`, plus a merge branch**.
+The structure is managed with [git-spice](https://abhinav.github.io/git-spice/) (local stacks only —
+all pushes and PRs are manual; the open upstream PR branch is **never** force-pushed or written to).
+
+```
+upstream/dev (trunk)
+│
+├── rocm-gfx1100-integration   ◄── THE OPEN UPSTREAM PR (frozen, read-only)
+│     Basic ROCm enablement only: HIP compat shims, build-system source
+│     filtering/compiler flags, centralized ext.py fallback dispatch, test
+│     device fixes, install docs. NO optimizations, NO new kernels.
+│     │
+│     └── rocm-plumbing        ROCm-only integration layer:
+│           Python BC_* graph capture (bc_rocm.py), whole-decode-step CUDA
+│           graphs (block_graph_rocm.py), call-site wiring for the Triton
+│           kernels. Valid standalone (falls back to reconstruct_hgemm);
+│           fast when the kernels line is merged in.
+│           │
+│           └── rocm-aiter     AITER kernel bridge (Triton RMSNorm via
+│                               torch.library custom ops). ROCm-only; auto-
+│                               detects availability, falls back gracefully.
+│
+└── triton-kernels             PORTABLE, CUDA-testable Triton kernels:
+      exl3_gemm_triton.py (bit-identical Triton FWHT, fused dequant+GEMV with
+      gather-free algebraic decode for bits 4/6, LinearEXL3_triton
+      composition op), gdn_ba_gemm.py, attn_rocm_kernels.py + tests + benches.
+      Submittable to upstream independently of the ROCm PR.
+
+integration  (merge branch, never upstreamed)
+      = rocm-aiter + triton-kernels + fork-only files (this README section,
+      AGENTS.md). The complete, deployable state. Rebuilt by merging the two
+      line tips whenever either moves.
+```
+
+### Rules
+
+- **`rocm-gfx1100-integration` is frozen.** It backs an open upstream PR. Never push, rebase, or
+  amend it. If upstream review changes it, rebase the stack onto the new tip afterwards.
+- **Kernels stay portable.** Anything in `exl3_gemm_triton.py` / `gdn_ba_gemm.py` /
+  `attn_rocm_kernels.py` must import and test against the stock CUDA extension. ROCm-only wiring
+  lives on the plumbing line. The two lines share no files.
+- **PRs are opened manually by the maintainer** — agents and tooling never run `gs branch submit`.
+- **`integration` is the test/deploy target.** Full test suite + generation-identity check there
+  after any line moves.
+- Decode performance on RX 7900 XTX (Qwen3.6-27B, EXL3): 4.5 → ~17 tok/s across this fork's
+  kernels + graphs. Details and methodology in `AGENTS.md`.
 
 ## Architecture support
 
@@ -126,6 +178,20 @@ Relevant env variables for building:
 - `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for compilation. Set this to a reasonable value like 4 in that case.  
 - `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch will build/load it at runtime instead.
 
+
+### **Experimental** ROCm (AMD GPUs) support
+
+ROCm support is experimental and performance is significantly reduced compared to CUDA. Install ROCm PyTorch and the ROCm SDK from AMD's wheel index, then build with `ROCM_HOME` pointing at the SDK:
+
+```sh
+pip install rocm[libraries,devel] "torch[device-gfx1100]" --index-url https://repo.amd.com/rocm/whl-multi-arch/
+pip install -r requirements.txt
+python -m rocm_sdk init
+export ROCM_HOME="$(python -m rocm_sdk path --root)"
+pip install . --no-build-isolation
+```
+
+ROCm support is functional via PyTorch-native fallbacks for CUDA-specific kernels (tensor-core GEMM, cooperative groups, custom attention). Tested on gfx1100 (RX 7900 XTX).
 
 ## Conversion
 

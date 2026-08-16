@@ -87,12 +87,21 @@ else:
 
     # compiler flags
 
+    library_dir = os.path.dirname(os.path.abspath(__file__))
+    sources_dir = os.path.join(library_dir, extension_name)
+
     extra_cflags = []
-    extra_cuda_cflags = [
-        "-lineinfo", "-O3", "--use_fast_math",
-        "-Xcudafe", "--diag_suppress=177",
-        "-Xcudafe", "--diag_suppress=20012",
-    ]
+    extra_cuda_cflags = []
+
+    if torch.version.hip:
+        extra_cuda_cflags += ["-Ofast", "-DUSE_ROCM", "-Wno-register"]
+        extra_cflags += ["-DUSE_ROCM"]
+    else:
+        extra_cuda_cflags += [
+            "-lineinfo", "-O3", "--use_fast_math",
+            "-Xcudafe", "--diag_suppress=177",
+            "-Xcudafe", "--diag_suppress=20012",
+        ]
 
     if windows:
         # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break
@@ -119,7 +128,10 @@ else:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
 
     if verbose:
-        extra_cuda_cflags += ["--ptxas-options=-v"]
+        if torch.version.hip:
+            extra_cuda_cflags += ["-verbose"]
+        else:
+            extra_cuda_cflags += ["--ptxas-options=-v"]
 
     # linker flags
 
@@ -132,14 +144,9 @@ else:
 
     # sources
 
-    library_dir = os.path.dirname(os.path.abspath(__file__))
-    sources_dir = os.path.join(library_dir, extension_name)
-    sources = [
-        os.path.abspath(os.path.join(root, file))
-        for root, _, files in os.walk(sources_dir)
-        for file in files
-        if file.endswith(('.c', '.cpp', '.cu'))
-    ]
+    from .exllamav3_ext.build_config import get_sources as _get_sources
+    is_rocm = bool(torch.version.hip)
+    sources = _get_sources(sources_dir, is_rocm)
 
     # Load extension
 
@@ -153,3 +160,75 @@ else:
         extra_cuda_cflags = extra_cuda_cflags,
         extra_cflags = extra_cflags
     )
+
+
+# When a BC_* class is not compiled into the extension (e.g. on ROCm where the
+# libtorch/ sources are excluded), make attribute access return a callable that
+# yields None instead of raising AttributeError. This lets call sites write
+# ``self.bc = ext.BC_Mamba2(...)`` unconditionally — they get None on platforms
+# that lack the class, and the real object on platforms that have it.
+
+if torch.version.hip:
+    from .ext_fallbacks import _BCNone
+
+    _bc_none = _BCNone()
+
+    # BC_* constructors: default every name to the None-yielding stub, then
+    # install the real Python graph-capturing implementations for the linear
+    # classes (defined in bc_rocm.py) when the Triton kernels they dispatch to
+    # (triton-kernels line) are importable. Without the kernels the stubs
+    # yield None and linears fall back to reconstruct_hgemm, so this line
+    # (rocm-plumbing) stays valid standalone.
+    for _name in [
+        'BC_Mamba2', 'BC_GatedDeltaNet', 'BC_GatedDeltaNetSplit',
+        'BC_MLP', 'BC_GatedMLP', 'BC_BlockSparseMLP',
+        'BC_Attention', 'BC_GatedRMSNorm',
+        'BC_LinearEXL3', 'BC_LinearFP16',
+        'BC_DSV4Compressor', 'BC_DSV4Attention', 'BC_DSV4BatchAttention',
+        'BC_MLAttention', 'BC_SAM',
+    ]:
+        if not hasattr(exllamav3_ext, _name):
+            setattr(exllamav3_ext, _name, _bc_none)
+    try:
+        import exllamav3.modules.quant.exl3_triton as _exl3_kernels  # noqa: F401
+        from .bc_rocm import BC_LinearEXL3, BC_LinearFP16
+        exllamav3_ext.BC_LinearEXL3 = BC_LinearEXL3
+        exllamav3_ext.BC_LinearFP16 = BC_LinearFP16
+    except ImportError:
+        pass
+
+    # C++ functions from excluded source files: replace with PyTorch implementations
+    from . import ext_fallbacks as _fb
+
+    for _name in [
+        'silu_mul', 'silu_oai_mul', 'gelu_mul', 'relu2_mul', 'relu_mul', 'xielu',
+        'mul_sigmoid_', 'mul_sigmoid_broadcast_', 'mul_softplus_broadcast_',
+        'add_sigmoid_gate', 'add_sigmoid_gate_proj', 'deinterleave_qg',
+        'rms_norm', 'rms_norm_res_in', 'gated_rms_norm',
+        'softcap',
+    ]:
+        if not hasattr(exllamav3_ext, _name):
+            setattr(exllamav3_ext, _name, getattr(_fb, _name))
+
+    # When AITER is available, register custom ops and upgrade norm fallbacks
+    from .aiter_kernels import is_aiter_available as _aiter_ok
+    if _aiter_ok():
+        from . import aiter_kernels as _ak
+        _ak._register_custom_ops()
+        for _name in ['rms_norm', 'rms_norm_res_in']:
+            setattr(exllamav3_ext, _name, getattr(_ak, _name))
+
+    # Constants and functions guarded by fused_sampler_enable in generator/sampler/custom.py.
+    # Disable the fused sampler path on ROCm by setting the flag and providing stub values.
+    if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_MAX_BLOCKS'):
+        setattr(exllamav3_ext, 'FUSED_SAMPLER_MAX_BLOCKS', 0)
+    if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE'):
+        setattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE', 0)
+    os.environ.setdefault('EXL3_FUSED_SAMPLER', '0')
+
+    # The graph-captured BC attention block (bc_attn.py) depends on ext.BC_Attention and
+    # ext.TritonKernel, neither of which is compiled on ROCm. Now that BC_LinearEXL3 is a
+    # real (non-None) object, the attention gating in _module_eligible would otherwise turn
+    # the path on and crash in _compile_kernel. Disable it here so attention falls back to
+    # the regular dispatch path, while the EXL3 linear layers still benefit from graph capture.
+    os.environ.setdefault('EXL3_BC_ATTN', '0')
