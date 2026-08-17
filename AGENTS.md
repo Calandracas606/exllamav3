@@ -63,7 +63,7 @@ integration = merge(rocm-aiter, rocm-flydsl, triton-kernels) + this AGENTS.md + 
    --ignore=tests/test_ext_norm_.py --ignore=tests/test_mla.py
    --ignore=tests/test_dsa_kernels.py --ignore=tests/test_reconstruct_had.py
    --ignore=tests/test_dsv4_compress_kernel.py
-   --ignore=tests/test_triton_paged_overflow.py -q` → expect **370 passed / 66 skipped**
+   --ignore=tests/test_triton_paged_overflow.py -q` → expect **486 passed / 68 skipped**
 2. Generation identity: 3 prompts × ≥200 tokens, argmax, whole-step graphs on, every
    env kill switch toggled, vs the previous verified state.
 3. `bench_decode.py --model 27b --num-tokens 512` — median windowed steady-state.
@@ -156,6 +156,11 @@ integration = merge(rocm-aiter, rocm-flydsl, triton-kernels) + this AGENTS.md + 
 - Whole-step vs per-block graphs on gfx1100/ROCm 7.14: identical wall (~76 ms;
   2496 nodes) - graph-node execution has ~14 us/node frontend cost here, so
   graphs cut CPU dispatch (28 ms -> 0.2 ms) but cannot cut GPU-frontend gaps.
+- CORRECTION (causal profiling 2026-06): EXL3_BLOCK_GRAPHS=0 with per-linear BC
+  graphs still on costs only +4 ms/token on BOTH 9B and 27B — the 28→0.2 ms
+  dispatch win was banked by per-linear graphs + whole-step TOGETHER; the
+  whole-step graph's marginal value over per-linear-only is ~4 ms/token.
+  Steady-state decode is GPU-kernel-bound, not dispatch-bound.
 - pytest needs EXL_TEST_DEVICE=cuda:0 on this 2-GPU box (default cuda:2 fails
   with "invalid device ordinal").
 
@@ -311,3 +316,36 @@ reached 449 via the run-group funnel decode — 8 groups of 4 windows
 share one 32-bit funnel each — independently verified at 452).
 9B per-bitwidth eval/perf.py profiles with EXL3_PREFER_TRITON_LINEAR=1:
 decode 38-47 tok/s across the 2.0-6.0bpw models; 4.0bpw fastest (44-47).
+NOTE (2026-06): at 4 bpw decode with whole-step graphs ON, EXL3_PREFER_TRITON_LINEAR=1
+is a measured NO-OP — BC_LinearEXL3 already dispatches to the same Triton kernels;
+the env only changes the dispatch entry point (9B 17.46 vs 17.56 ms, 27B parity).
+
+## Decode causal profiling (2026-06, bench/REPORT_decode_causal_profiling.md)
+- Baselines re-measured (ctx=512, bsz=1, graphs on, interleaved): 27B 57.19 ms/tok
+  (17.5 tok/s), 9B-4bpw 17.62 ms (56.8 tok/s).
+- 27B causal attribution (ablation, patch-BEFORE-capture, interleaved bases):
+  MLP 29.81 ms (52.1%; 8.70 GB/tok → 292 GB/s in-situ) · GDN 12.54 (qkv 257 GB/s,
+  z/o 200-260) · non-GEMV residual 8.92 (block norms alone = 3.40 ms on 9B: 64
+  rms_norm + 48 gated_rms_norm through Python fallbacks, ~7 unfused kernels each)
+  · FATTN 3.60 · lm_head 2.32 (411 GB/s — best in-model in-situ rate).
+- MLP spread is ~2x INSIDE one block: down_proj (K=17408, N=5120) 233 GB/s vs
+  gate_proj (K=5120, N=17408) ~500 GB/s. Shape-dependent (CTA count / latency),
+  not bitwidth — the #1 open question for kernel work.
+- Roofline: 33 tok/s needs 444 GB/s whole-model sustained (13.45 GB/tok).
+  500 GB/s GEMV + 4.5 ms residual → 29.5 tok/s; 550 GB/s + 3 ms → 34.0 tok/s.
+- Surprises vs priors: (1) BC_Attention DECLINES on all full-attn layers even
+  when EXL3_BC_ATTN=1 is forced (_module_eligible, likely the mRoPE/NoPE clause);
+  a hipified TritonKernel (triton_kernel_hip.cpp, hipModuleLoadData) exists
+  in-tree but is unbound on ROCm — a build-config change, not a port; (2) the
+  remaining CUDA-only prize is the BC_* COMPUTE fusions (BC_GatedRMSNorm,
+  BC_MLP silu·gate epilogue, ~5 ms/token of unfused fallback norms), NOT launch
+  machinery; (3) exl3_mgemm (multi-matrix packed launch) is CUDA-only and unused
+  in decode on ROCm (the Triton fused-qkv covers decode; prefill does not).
+- Methodology guards (hard-won): runtime monkeypatches must be installed BEFORE
+  whole-step graph capture (post-capture patches are invisible to replay);
+  decoding at past_len>0 without prefill = hipErrorIllegalAddress; mid-run graph
+  recapture LIVELOCKS the GPU (only fresh subprocesses); raw model.forward decode
+  faults on 27B — the Generator flow (bench_decode.py) is the proven harness.
+- Tooling: rocprofiler-systems is NOT on PyPI (404); `rocm[profiler]` from the
+  AMD index installs rocprof-sys-run (rocm-profiler 7.14.0). Trustworthy numbers
+  still come from cuda events + ablation + interleaved toggles (AGENTS protocol).
