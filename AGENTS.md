@@ -77,6 +77,13 @@ integration = merge(rocm-aiter, rocm-flydsl, triton-kernels) + this AGENTS.md + 
 | + 6-bit fast path + whole-step graphs | 15.0 | 66.6 |
 | + fused b/a GEMV | 17.4 | 57.6 |
 | + fused attention kernels | ~17.6 | ~57 |
+| + MLP GEMV: config pools + M=1 split-K b4/b6 (perf.py protocol) | **20.2** | ~49.5 |
+
+(27B eval/perf.py decode, mean over contexts: 16.66 baseline → 18.24 after down_proj
+split-K → 20.2 after large-N + b6 extension; perf.py is the canonical protocol —
+its raw-model.forward loop includes ~2.7 ms/token of dispatch/harness overhead that
+the Generator flow (graphs on) does not; both quoted where relevant.)
+9B: 57.0 → 71.6 tok/s · 9B-6bpw: 40.4 → 63.3 tok/s (same session A/B, Generator flow).
 
 ## Environment (RX 7900 XTX, gfx1100, ROCm 7.14, torch 2.12+rocm, triton 3.7.1)
 - Main repo venv: `/tmp/conversation-worktrees/395af3ac-0a32-4b2a-b348-819aab4fe32a/exllamav3/.venv`
@@ -349,3 +356,23 @@ the env only changes the dispatch entry point (9B 17.46 vs 17.56 ms, 27B parity)
 - Tooling: rocprofiler-systems is NOT on PyPI (404); `rocm[profiler]` from the
   AMD index installs rocprof-sys-run (rocm-profiler 7.14.0). Trustworthy numbers
   still come from cuda events + ablation + interleaved toggles (AGENTS protocol).
+
+## MLP GEMV optimization (2026-08, landed via triton-kernels; bench/REPORT_mlp_optimization.md)
+- Landed: N-bucketed + width-aware M=1 autotune pools, M=1 split-K GEMV (b4 then b6)
+  with fused reduce+output-Hadamard, extended to large-N shapes (gate/up, qkv-class).
+  bench/bench_exl3_gemv.py = per-bitwidth GEMV bandwidth benchmark (--shape K:N).
+- 27B perf.py: 16.66 → 20.2 tok/s (+21%); Generator A/B 56.9 → 46.9 ms/token.
+  9B 57→71.6, 9B-6bpw 40.4→63.3 tok/s. Generation byte-identical vs refs.
+- In-situ kernel rates (27B): down_proj 239→~390 GB/s, gate/up 310→~388. The b4
+  split path is 764-910 Gweights/s — ABOVE FlyDSL's b6 578 Gw/s; >25 tok/s needs
+  the out-of-file residual (norms ~5-6 ms, attn 3.6, GDN glue 2.5, sampler 1.5),
+  not more kernel work in this file.
+- Kernel-structure limits measured (do not retry blindly): tensor-Triton split-K
+  is the best structure on Triton for these shapes; a spill-free lane-local port
+  (FlyDSL structure, 66-90 regs, 0 spills) was built and was SLOWER (Triton needs
+  contiguous staged loads); shipping variants hit the 256-VGPR cap (17-459 spills)
+  yet occupancy is NOT the binding constraint (proven by the spill-free port).
+  Every decode stream is within ~10% of its class best (per-shape audit).
+- Methodology: benchmark clock-ramp must SYNC PER MATMUL (async-launch backlog
+  = phantom GPU grind, cost an hour of debugging); autotune needs a long ramp
+  first (mis-ranked picks up to 24%); isolated benches overstate in-situ by 25-35%.
