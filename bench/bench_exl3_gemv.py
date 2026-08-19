@@ -87,6 +87,9 @@ def main():
                     help="comma-separated bit widths to benchmark")
     ap.add_argument("--shapes", default="down,wide,stream",
                     help="comma-separated shape names to benchmark")
+    ap.add_argument("--shape", action="append", default=[], metavar="K:N",
+                    help="extra custom shape as K:N (repeatable); e.g. the "
+                         "real 27B down_proj is --shape 17408:5120")
 
 
     args = ap.parse_args()
@@ -94,6 +97,9 @@ def main():
     dev = torch.device("cuda:0")
     sel_bits = [int(b) for b in args.bits.split(",")]
     sel_shapes = [s for s in SHAPES if s[0] in set(args.shapes.split(","))]
+    for spec in args.shape:
+        k, n = (int(v) for v in spec.split(":"))
+        sel_shapes.append((f"K{k}N{n}", k, n))
     print(torch.cuda.get_device_name(0), flush=True)
     print(f"{'bits':>4} {'shape':>7} {'K':>6} {'N':>6} {'us/call':>9} "
           f"{'GB/s':>7} {'Gweights/s':>11}", flush=True)
