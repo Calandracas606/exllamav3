@@ -8,6 +8,9 @@ if TYPE_CHECKING:
 from ..model.model_tp_alloc import TPAllocation
 from functools import cached_property
 
+# Triton-on-ROCm workaround gate (see prepare_for_device)
+_is_hip = torch.version.hip is not None
+
 # Use host bounce when moving state from device to device in layer split
 no_p2p_copy = os.environ.get('EXLLAMA_NO_P2P_COPY', None)
 
@@ -91,6 +94,14 @@ class Module(ABC):
                 # blocking the host; the copy is stream-ordered ahead of the consuming kernels
                 nb = x.device.type == "cpu" and x.is_pinned()
                 x = x.to(self.device, non_blocking = nb)
+        # Triton on ROCm launches through the thread's current device, not the
+        # tensors', so a module on a non-current GPU gets mismatched pointers.
+        # CUDA resolves the device from the tensors.
+        if _is_hip:
+            mod_dev = self.device
+            if isinstance(mod_dev, (int, str)): mod_dev = torch.device(mod_dev)
+            if mod_dev is not None and mod_dev.type == "cuda" and torch.cuda.current_device() != mod_dev.index:
+                torch.cuda.set_device(mod_dev)
         return x
 
     def get_qmaps(self):

@@ -137,9 +137,8 @@ namespace cuda
 }
 #endif
 
-// Inter-block barrier for the grouped MoE launch (ptx.cuh's cuda::atomic_ref form;
-// mgemm is host-declined on ROCm today, but the templated kernels still build via
-// the shared comp_units). Sense-reversing arrive-and-wait over the same counter
+// Inter-block barrier for the grouped MoE launch (ptx.cuh's cuda::atomic_ref form).
+// Sense-reversing arrive-and-wait over the same counter
 // layout: [2*group_id] = arrival count, [2*group_id + 1] = sense.
 __device__ inline void group_barrier
 (

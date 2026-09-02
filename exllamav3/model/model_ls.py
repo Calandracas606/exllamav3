@@ -141,7 +141,10 @@ class Model_LSMixin(ABC):
                             prev_load_device = load_device
                             i = active_devices[current_device_i]
                             touched_devices.append(i)
-                            i = active_devices[current_device_i]
+                            # Triton on ROCm binds to the thread's current device
+                            # (see Module.prepare_for_device)
+                            if torch.version.hip:
+                                torch.cuda.set_device(i)
                             if reserve_per_device is not None:
                                 set_memory_fraction_reserve(reserve_per_device[i], i)
                             elif use_per_device is not None:
