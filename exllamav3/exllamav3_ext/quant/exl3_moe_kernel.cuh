@@ -10,7 +10,13 @@
 #include "../util.cuh"
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
+// Platform inner (same seam as exl3_gemm_kernel.cuh): the split-K streaming
+// inner on HIP provides exl3_gemm_kernel_inner behind the identical signature
+#if defined(USE_ROCM)
+#include "exl3_gemm_inner_rocm.cuh"
+#else
 #include "exl3_gemm_inner.cuh"
+#endif
 #include "exl3_devctx.cuh"
 #include "../ptx.cuh"
 
@@ -43,6 +49,9 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 
     // Individual GEMM barriers per group
     locks += group_idx * MAX(hidden_dim, intermediate_dim) / 128;
+#if defined(USE_ROCM)
+    __shared__ float inner_sh[EXL3_INNER_SH_FLOATS(MOE_TILESIZE_N)];
+#endif
 
     // Dynamic expert assignment: active experts are numbered in scan order, and each group processes the active
     // expert matching its current ticket. Initial tickets are the group indices; after finishing an expert, a group
@@ -127,7 +136,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     hidden_dim,         \
                     intermediate_dim,   \
                     locks,              \
-                    nullptr
+                    nullptr,            \
+                    inner_sh
                 #define SHAPE_ARGS      \
                     MOE_TILESIZE_M,     \
                     MOE_TILESIZE_K,     \
@@ -201,7 +211,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     intermediate_dim,   \
                     hidden_dim,         \
                     locks,              \
-                    nullptr
+                    nullptr,            \
+                    inner_sh
                 #define SHAPE_ARGS      \
                     MOE_TILESIZE_M,     \
                     MOE_TILESIZE_K,     \
