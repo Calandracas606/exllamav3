@@ -517,6 +517,7 @@ void gated_rms_norm_kernel
     constexpr bool output_fp16 = std::is_same_v<output_t, half>;
     constexpr bool weight_bf16 = std::is_same_v<weight_t, bfloat16>;
     constexpr bool gate_fp32   = std::is_same_v<gate_t,   float>;
+    constexpr bool gate_fp16   = std::is_same_v<gate_t,   half>;
 
     int t = threadIdx.x;
     int warp_id = threadIdx.x / 32;
@@ -535,8 +536,9 @@ void gated_rms_norm_kernel
         if (gate_first)
         {
             float4 g4;
-            if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row * dim)) + column);
-            else                       read_bfloat164(g4, ((const bfloat164*) (g + row * dim)) + column);
+            if constexpr (gate_fp32)       read_float4   (g4, ((const float4*)    (g + row * dim)) + column);
+            else if constexpr (gate_fp16)  read_half4<false>(g4, ((const half4*)      (g + row * dim)) + column);
+            else                           read_bfloat164(g4, ((const bfloat164*) (g + row * dim)) + column);
             x4.x *= _gate_fn(g4.x);
             x4.y *= _gate_fn(g4.y);
             x4.z *= _gate_fn(g4.z);
@@ -559,8 +561,9 @@ void gated_rms_norm_kernel
         read_bfloat164(x4, ((const bfloat164*) (x + row * dim)) + column);
         if constexpr (weight_bf16) read_bfloat164(w4, ((const bfloat164*) w_row) + column);
         else                       read_float4   (w4, ((const float4*)    w_row) + column);
-        if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row * dim)) + column);
-        else                       read_bfloat164(g4, ((const bfloat164*) (g + row * dim)) + column);
+        if constexpr (gate_fp32)       read_float4   (g4, ((const float4*)    (g + row * dim)) + column);
+        else if constexpr (gate_fp16)   read_half4<false>(g4, ((const half4*)      (g + row * dim)) + column);
+        else                           read_bfloat164(g4, ((const bfloat164*) (g + row * dim)) + column);
 
         if (constant_bias != 0.0f)
         {
@@ -681,6 +684,17 @@ void gated_rms_norm_gr
     else __(kBFloat16, bfloat16, kBFloat16, bfloat16, kHalf,  half,  kFloat,    float,    false, NUM_THREADS)
     else __(kBFloat16, bfloat16, kBFloat16, bfloat16, kFloat, float, kFloat,    float,    true,  32         )
     else __(kBFloat16, bfloat16, kBFloat16, bfloat16, kFloat, float, kFloat,    float,    false, NUM_THREADS)
+
+    // Half-gate combos from the GDN split-projection path (z projection outputs
+    // half); valid on any platform
+    else __(kBFloat16, bfloat16, kFloat,    float,    kHalf,  half,  kHalf,  half,  true,  32         )
+    else __(kBFloat16, bfloat16, kFloat,    float,    kHalf,  half,  kHalf,  half,  false, NUM_THREADS)
+    else __(kBFloat16, bfloat16, kFloat,    float,    kFloat, float, kHalf,  half,  true,  32         )
+    else __(kBFloat16, bfloat16, kFloat,    float,    kFloat, float, kHalf,  half,  false, NUM_THREADS)
+    else __(kBFloat16, bfloat16, kBFloat16, bfloat16, kHalf,  half,  kHalf,  half,  true,  32         )
+    else __(kBFloat16, bfloat16, kBFloat16, bfloat16, kHalf,  half,  kHalf,  half,  false, NUM_THREADS)
+    else __(kBFloat16, bfloat16, kBFloat16, bfloat16, kFloat, float, kHalf,  half,  true,  32         )
+    else __(kBFloat16, bfloat16, kBFloat16, bfloat16, kFloat, float, kHalf,  half,  false, NUM_THREADS)
 
     else TORCH_CHECK(false, "gated_rms_norm: Invalid datatypes for input/output");
     #undef __
