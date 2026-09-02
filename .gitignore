@@ -9,3 +9,11 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
+
+# torch's JIT loader (ext.py) hipifies sources in place on ROCm: foo.cu -> foo.hip,
+# foo.cpp/foo.cuh -> foo_hip.*, cuda_foo.* -> hip_foo.* (build_config.get_sources skips
+# these when walking the source list)
+exllamav3/exllamav3_ext/**/*_hip.*
+exllamav3/exllamav3_ext/**/*.hip
+exllamav3/exllamav3_ext/**/hip_*.*
+__disk_lru_cache__/
