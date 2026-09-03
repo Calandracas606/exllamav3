@@ -288,6 +288,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
 #include "dsa_topk.cuh"
 #include "hc_mix.cuh"
+#include "ple.cuh"
+#include "ngram.cuh"
 
 #include "cache/q_cache.cuh"
 #include "quant/exl3_moe.cuh"
@@ -347,9 +349,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("moe_split_collect_add", &moe_split_collect_add, "moe_split_collect_add");
     m.def("dsa_topk", &dsa_topk, "dsa_topk");
     m.def("hc_mix", &hc_mix, "hc_mix");
+    m.def("ple_gate", &ple_gate, "ple_gate");
+    m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
+    m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
+    m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
+    m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
     m.def("hc_head", &hc_head, "hc_head");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
+    m.def("gr_mix", &gr_mix, "gr_mix");
     m.def("routing_std", &routing_std, "routing_std");
     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
@@ -441,6 +449,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
     m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
     m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
+    m.def("gdn_lowrank_gemv_f", [](const at::Tensor& x, const at::Tensor& w_t, at::Tensor& y)
+        { gdn_lowrank_gemv_f_gr(x, w_t, y, nullptr); }, "gdn_lowrank_gemv_f");
+    m.def("kda_gate_op", [](const at::Tensor& qkv, const at::Tensor& b, const at::Tensor& f,
+                            const at::Tensor& dt_bias, const at::Tensor& a_log,
+                            at::Tensor& mixed_qkv, at::Tensor& beta, at::Tensor& g,
+                            float lower_bound, float beta_scale)
+        { kda_gate_op_gr(qkv, b, f, dt_bias, a_log, mixed_qkv, beta, g, lower_bound, beta_scale, nullptr); },
+        "kda_gate_op");
 
     py::class_<ConvRewindJob>(m, "ConvRewindJob")
         .def(py::init<uintptr_t, uintptr_t, int, int, int>());
