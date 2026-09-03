@@ -81,4 +81,9 @@ __device__ __forceinline__ __hip_bfloat16 float2bfloat16_rn(float f)
 #endif
 #endif
 
+// gfx1100 hard limit: 64 KB LDS per block, and unlike NVIDIA GPUs there is no
+// dynamic-smem opt-in beyond it (hipDeviceAttributeSharedMemPerBlockOptin errors).
+// Consumers gate oversized shared staging (quantize_tiles' K = 2 cost tables) on this.
+#define QUANTIZE_TILES_SMEM_LIMIT 65536
+
 #endif  // !defined(USE_ROCM) || defined(__HIPCC__)
