@@ -72,7 +72,7 @@ Always adding more, stay tuned.
 
 Currently on the to-do list:
 
-- ROCm support
+- Full ROCm support (nearly all kernels now build natively; see the ROCm section below)
 
 As for what is implemented, expect that some things may be a little broken at first. Please be patient, raise issues and/or contribute. 👉👈 
 
@@ -127,7 +127,21 @@ pip install .
 Relevant env variables for building:
 - `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for compilation. Set this to a reasonable value like 4 in that case.  
 - `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch will build/load it at runtime instead.
+- `EXL_TEST_DEVICE`: test-suite device override (e.g. `cuda:1`).
 
+
+### Experimental ROCm (AMD GPUs) support
+
+ROCm support is experimental and performance is significantly reduced compared to CUDA. Install ROCm PyTorch and the ROCm SDK from AMD's wheel index, then build as usual:
+
+```sh
+pip install rocm[libraries,devel] "torch[device-gfx1100]" --index-url https://repo.amd.com/rocm/whl-multi-arch/
+pip install -r requirements.txt
+python -m rocm_sdk init
+pip install . --no-build-isolation
+```
+
+All extension kernels except the warp-matrix (mma.sync) EXL3 GEMV engines build natively on HIP: the EXL3 GEMM/GEMV stack (its inner implements the same lock-cascade column-reduction contract as the CUDA kernels, so the multi-matrix GEMM and the fused MoE kernels run too), attention (paged, bighead and DSv4 host paths), the quantized KV cache, quantization/conversion kernels, norms, activations, routing, rope, the fused sampler, the DSv4 compressor, the MoE CPU offload kernels and the tensor-parallel collectives. Inference runs through these native kernels across the per-expert graph, multi-row and fused MoE paths. Required entry points that are not built fail with a clear error; the optional int8 GEMV fast path simply never engages. EXL3 conversion kernels are available but the conversion flow has not been exercised end-to-end on ROCm yet. Tested on gfx1100 (RX 7900 XTX); run `tests/test_rocm_smoke.py` after building.
 
 ## Conversion
 

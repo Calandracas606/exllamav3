@@ -8,7 +8,8 @@ import torch
 from exllamav3.ext import exllamav3_ext as ext
 
 torch.manual_seed(0)
-device = "cuda:1"
+import os
+device = os.environ.get("EXL_TEST_DEVICE", "cuda:1")
 torch.cuda.set_device(device)
 
 

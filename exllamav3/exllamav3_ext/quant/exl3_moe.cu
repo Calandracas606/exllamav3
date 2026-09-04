@@ -8,6 +8,13 @@ namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
 #include "comp_units/exl3_moe_instances.cuh"
+// The fused MoE kernels take the split-K streaming inner (exl3_gemm_kernel.cuh's
+// USE_ROCM seam); this TU does not include that header, so re-declare the launch
+// size here instead of letting exl3_moe_common.cuh's CUDA fallback (90 KB) win
+#if defined(USE_ROCM)
+#undef SMEM_MAX
+#define SMEM_MAX (8 * 1024)
+#endif
 #include "exl3_devctx.cuh"
 #include <set>
 
@@ -227,7 +234,7 @@ void exl3_moe
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
         moe_kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }

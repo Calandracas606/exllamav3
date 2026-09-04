@@ -72,7 +72,16 @@ void quantize_tiles
     int device;
     cudaGetDevice(&device);
     const int max_batch_size = MIN((int) temp_costs.size(0), 2 * DevCtx::instance().get_num_sms(device));
-    const int shmem = (K >= 2 ? 2 * edges * sizeof(half) : 0) + L * sizeof(half) + 64 + 128;
+    // Mirror quantize_tiles_kernel.cuh's costs_in_shared: when the device's smem ceiling
+    // cannot hold the K >= 2 cost tables, the kernel uses the global tables and no dynamic
+    // smem is requested for them (launching with an oversized request fails outright)
+#if defined(USE_ROCM)
+    const size_t cost_tables = (K >= 2 && (size_t) 2 * edges * sizeof(half) + L * sizeof(half) + 64 + 128 <= QUANTIZE_TILES_SMEM_LIMIT)
+        ? 2 * edges * sizeof(half) : 0;
+#else
+    const size_t cost_tables = (K >= 2) ? 2 * edges * sizeof(half) : 0;
+#endif
+    const int shmem = cost_tables + L * sizeof(half) + 64 + 128;
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
@@ -80,7 +89,7 @@ void quantize_tiles
     auto kernel = L == 256 ?
         quantize_tiles_kernel_instances[K - 1 + 8 * cb] :
         quantize_tiles_kernel_instances_l160[K - 1];
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+    cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
     cuda_check(cudaPeekAtLastError());
 
     for (int batch_i = 0; batch_i < num_tiles; batch_i += max_batch_size)
