@@ -1,4 +1,9 @@
 #pragma once
+// ROCm: the AMDGCN equivalents of the portable primitives below come from
+// ptx_rocm_compat.cuh; the CUDA-only contents of this header do not parse on HIP
+#if defined(USE_ROCM)
+#include "ptx_rocm_compat.cuh"
+#else
 #include <cuda/atomic>
 
 // Tensor core fragments
@@ -346,3 +351,4 @@ __device__ inline void group_barrier
 
     __syncthreads();
 }
+#endif

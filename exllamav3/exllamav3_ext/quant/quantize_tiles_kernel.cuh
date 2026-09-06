@@ -20,6 +20,14 @@
 #define H_INF __ushort_as_half(0x7c00)
 #endif
 
+#if defined(USE_ROCM)
+// gfx1100-class devices have 64 KB of shared memory per block with no opt-in headroom
+// (hipDeviceAttributeSharedMemPerBlockOptin does not exist), so the K = 2 cost tables
+// (2 * 16384 * 2 B = 64 KB alone) cannot stage in shared; they use the global-memory
+// tables like K = 1. Defined in compat.cuh/compat_rocm.cuh.
+#define QUANTIZE_TILES_SMEM_LIMIT 65536
+#endif
+
 template <int K, int cb, int L = 256>
 __global__ __launch_bounds__(QUANTIZE_TILES_NUM_THREADS, 2)
 void quantize_tiles_kernel
@@ -50,7 +58,16 @@ void quantize_tiles_kernel
     int* sh_idx = (int*) sh; sh += 32 * sizeof(int);
 
     half* sh_temp_costs = (half*) sh;
+#if defined(USE_ROCM)
+    // K == 2's tables alone are 64 KB; when the device's dynamic-smem ceiling
+    // (QUANTIZE_TILES_SMEM_LIMIT, compat_rocm.cuh) cannot fit them, fall back
+    // to the global tables as K == 1 does
+    half* temp_costs =
+        (K >= 2 && (size_t) 2 * edges * sizeof(half) + L * sizeof(half) + 64 + 128 <= QUANTIZE_TILES_SMEM_LIMIT)
+        ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
+#else
     half* temp_costs = K >= 2 ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
+#endif
     half* temp_costs_inc = temp_costs + edges;
 
     if (thread < L) sh_input_tile[thread] = __float2half_rn(input_tile[thread]);

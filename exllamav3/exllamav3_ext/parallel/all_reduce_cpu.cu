@@ -539,6 +539,12 @@ void pg_all_reduce_cpu
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     pg_check_timeout(ctx);
 
+#if defined(USE_ROCM)
+    // Collectives must not inherit an unrelated error left by an earlier HIP call in
+    // this thread (it would otherwise surface misattributed at the first collective)
+    cudaGetLastError();
+#endif
+
     TORCH_CHECK(is_avx2_supported(), "AVX2 is required for tensor-parallel inference using native backend");
 
     uint32_t device_mask = 0;

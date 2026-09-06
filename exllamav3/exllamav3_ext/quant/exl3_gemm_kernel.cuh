@@ -2,7 +2,14 @@
 
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
+// Platform inner: CUDA keeps the ptx tensor-core pipeline; HIP provides a split-K
+// streaming inner behind the identical template signature (see the header for
+// the tier structure). Consumers and the comp_units instantiations are shared.
+#if defined(USE_ROCM)
+#include "exl3_gemm_inner_rocm.cuh"
+#else
 #include "exl3_gemm_inner.cuh"
+#endif
 #include "exl3_devctx.cuh"
 
 template<EXL3_GEMM_T_ARGS>
@@ -33,12 +40,19 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     int size_m_ = size_m;
     const half* A_ = A;
     void* C_ = C;
+#if defined(USE_ROCM)
+    __shared__ float inner_sh[EXL3_INNER_SH_FLOATS(TILESIZE_N)];
+#endif
 
     while (size_m_ > 0)
     {
         exl3_gemm_kernel_inner
         <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
-        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks, svh);
+        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks, svh
+#if defined(USE_ROCM)
+        , inner_sh
+#endif
+        );
 
         A_ += 16 * size_k;
         if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
@@ -144,6 +158,10 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         bszm = bszm_sync;
     }
 
+#if defined(USE_ROCM)
+    __shared__ float inner_sh[EXL3_INNER_SH_FLOATS(TILESIZE_N)];
+#endif
+
     for (int i = 0; i < bszm; i += gridDim.z)
     {
         int j = i + blockIdx.z;
@@ -208,7 +226,11 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 
                 exl3_gemm_kernel_inner
                 <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
-                (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr);
+                (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr
+#if defined(USE_ROCM)
+                , inner_sh
+#endif
+                );
             }
 
             A_ += 16 * size_k;

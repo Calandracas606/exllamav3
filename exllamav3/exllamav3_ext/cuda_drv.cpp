@@ -6,6 +6,8 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <link.h>
+#include <cstring>
 #endif
 
 #define DRV_STR2(x) #x
@@ -29,8 +31,37 @@ const CudaDrv& CudaDrv::instance()
         #ifdef _WIN32
             void* lib = (void*) LoadLibraryA("nvcuda.dll");
         #else
-            void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+            // Prefer the HIP library the host process already has loaded (torch loads it on
+            // ROCm; wheel installs keep it outside the default loader search path, and
+            // dlopening a second copy would create two runtime instances whose module and
+            // context tables know nothing about each other). Torch's copy is loaded into a
+            // local scope (CPython dlopens RTLD_LOCAL), so dlsym(RTLD_DEFAULT) cannot see
+            // it; dl_iterate_phdr finds the loaded object's path and dlopening that exact
+            // path returns a handle to the same instance.
+            void* lib = nullptr;
+        #if defined(USE_ROCM)
+            if (dlsym(RTLD_DEFAULT, "hipModuleLoadData")) lib = RTLD_DEFAULT;
+            if (!lib)
+            {
+                struct PhdrCtx { const char* hit; } ctx = { nullptr };
+                dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int
+                {
+                    const char* base = std::strrchr(info->dlpi_name, '/');
+                    base = base ? base + 1 : info->dlpi_name;
+                    if (std::strncmp(base, "libamdhip64", 11) == 0)
+                    {
+                        static_cast<PhdrCtx*>(data)->hit = info->dlpi_name;
+                        return 1;
+                    }
+                    return 0;
+                }, &ctx);
+                if (ctx.hit) lib = dlopen(ctx.hit, RTLD_NOW | RTLD_GLOBAL);
+            }
+        #endif
+            if (!lib) lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
             if (!lib) lib = dlopen("libcuda.so", RTLD_NOW | RTLD_GLOBAL);
+            // ROCm: the HIP runtime exports the same (hipified) entry points
+            if (!lib) lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
         #endif
         TORCH_CHECK(lib, "Could not load the CUDA driver library");
 
