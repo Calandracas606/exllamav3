@@ -45,8 +45,7 @@ bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "1") != "0"
 # EXL3_BC_ATTN_TRACE=1: print build/decline per module/layer (activation check for A/B tests)
 _bc_trace = os.environ.get("EXL3_BC_ATTN_TRACE", "0") != "0"
 
-# Row budget of the graphed attention path: ROCm's captured GEMMs are M == 1 only, so
-# multi-row slots decline to the dispatch path; CUDA keeps the upstream unbounded budget
+# captured GEMMs are M == 1 only on HIP; multi-row slots decline to the dispatch path
 _GRAPHED_EXL3_ROWS_MAX = 1 if torch.version.hip else None
 
 def _trace_build(m, result, kind):
@@ -89,7 +88,11 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
         for name, ty in signature.items():
             if isinstance(ty, str) and ty.endswith(":16"):
                 sig[name] = ty[:-3]
-                attrs[(fn.arg_names.index(name),)] = [["tt.divisibility", 16]]
+                # without the pointer_range tag the AMD backend miscompiles wide-K tiles
+                spec = [["tt.divisibility", 16]]
+                if torch.version.hip:
+                    spec.append(["tt.pointer_range", 32])
+                attrs[(fn.arg_names.index(name),)] = spec
             else:
                 sig[name] = ty
         with torch.cuda.device(device):
@@ -106,14 +109,6 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
             k = ext.TritonKernel(cubin, ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
-
-
-def _get_sm_count(device: torch.device | int) -> int:
-    # TP shards store their device as a plain index
-    idx = device.index if hasattr(device, "index") else device
-    if idx not in _sm_count:
-        _sm_count[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
-    return _sm_count[idx]
 
 
 class BCAttn:
