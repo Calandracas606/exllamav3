@@ -36,7 +36,9 @@ void exl3_gemm_kernel_inner
     const int size_n,
     int* __restrict__ locks,
     const half* post_scale,
-    int size_n_stride = 0     // full width of B and C when computing a column slice (0: = size_n)
+    int size_n_stride = 0,   // full width of B and C when computing a column slice (0: = size_n)
+    float* __restrict__ sh = nullptr   // column-tile staging, unused on CUDA (signature parity)
+
 )
 {
     const int TILEBLOCKS_M = TILESIZE_M / 16;
