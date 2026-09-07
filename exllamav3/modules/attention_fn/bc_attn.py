@@ -45,6 +45,10 @@ bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "1") != "0"
 # EXL3_BC_ATTN_TRACE=1: print build/decline per module/layer (activation check for A/B tests)
 _bc_trace = os.environ.get("EXL3_BC_ATTN_TRACE", "0") != "0"
 
+# Row budget of the graphed attention path: ROCm's captured GEMMs are M == 1 only, so
+# multi-row slots decline to the dispatch path; CUDA keeps the upstream unbounded budget
+_GRAPHED_EXL3_ROWS_MAX = 1 if torch.version.hip else None
+
 def _trace_build(m, result, kind):
     if _bc_trace:
         print(f" -- BC-{kind}: {'built' if result is not None else 'DECLINED'}"
@@ -97,7 +101,9 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                     print(f" -- smem: BC {fn.__name__} {ck.metadata.shared} B over {limit} B, declining to eager", flush = True)
                 raise BCKernelTooLarge(
                     f"{fn.__name__}: {ck.metadata.shared} B of shared memory exceeds the device's {limit} B")
-            k = ext.TritonKernel(ck.asm["cubin"], ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
+            # Triton emits the same kernel as hsaco on ROCm (the loader accepts either)
+            cubin = ck.asm["hsaco"] if torch.version.hip else ck.asm["cubin"]
+            k = ext.TritonKernel(cubin, ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
 
@@ -596,6 +602,8 @@ class BCAttn:
                 # 0; the scoring/expansion bounds consume the scalar
                 position = int(host_seqlens[0].item())
 
+        if _GRAPHED_EXL3_ROWS_MAX is not None and bsz * q_len > _GRAPHED_EXL3_ROWS_MAX:
+            return None
         # The captured graph freezes the inv_freq table geometry (table flag, stride, partial
         # head dim) and the causality of the attention kernels, so either changing means
         # reconfigure (in practice constant per model). Everything else that varies per call --
