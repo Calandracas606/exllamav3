@@ -234,6 +234,21 @@ python examples/chat.py -h
 
 Always adding more, stay tuned.
 
+For the test suite, `EXL_TEST_DEVICE` overrides the test device (e.g. `cuda:1`).
+
+
+### Experimental ROCm (AMD GPUs) support
+
+ROCm support is experimental and performance is significantly reduced compared to CUDA. Install ROCm PyTorch and the ROCm SDK from AMD's wheel index, then build as usual:
+
+```sh
+pip install rocm[libraries,devel] "torch[device-gfx1100]" --index-url https://repo.amd.com/rocm/whl-multi-arch/
+pip install -r requirements.txt
+python -m rocm_sdk init
+pip install . --no-build-isolation
+```
+
+All kernels except the warp-matrix EXL3 GEMV engines build natively and inference runs through them; the EXL3 conversion flow is untested. Tested on gfx1100 (RX 7900 XTX).
 ## Conversion
 
 To convert a model to EXL3 format, use:
