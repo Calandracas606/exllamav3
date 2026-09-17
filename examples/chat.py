@@ -664,3 +664,9 @@ if __name__ == "__main__":
     parser.add_argument("-gcs", "--generator_chunk_size", type = int, default = 2048, help = "Maximum prompt-prefill chunk size, default = 2048")
     _args = parser.parse_args()
     main(_args)
+
+    # TheRock ROCm gfx1100: HSA's atexit handler segfaults during exit() after a TP session
+    # (fault is after all Python work completes). Runs Cleanupper hooks, then leaves via
+    # os._exit to skip the faulting C-level atexit chain. No-op elsewhere.
+    from exllamav3.util.misc import bypass_rocm_atexit_crash
+    bypass_rocm_atexit_crash(0)

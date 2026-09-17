@@ -18,6 +18,50 @@ from ..tokenizer.mm_embedding import send_embeddings
 cleanupper = Cleanupper()
 DISPATCH_TIMEOUT = 20
 
+
+def _ensure_shm_manager_rocm_env():
+    """
+    file_system tensor sharing (set below, required for TP IPC) makes libshm exec
+    torch/bin/torch_shm_manager. That child cannot resolve libtorch_cpu's ROCm
+    dependencies: the TheRock wheel bakes a build-time RUNPATH into libtorch_cpu.so
+    (points at the wheel-build machine), RUNPATH is not inherited from the executable,
+    and the freshly exec'd process gets none of the ctypes preloads that let the parent
+    import torch. Export the venv SDK's lib dirs so exec'd children can resolve them.
+    No-op on CUDA and on system-ROCm installs without the rocm_sdk package.
+    """
+
+    if not torch.version.hip:
+        return
+
+    try:
+        import rocm_sdk
+    except ImportError:
+        return
+
+    # Same set torch itself preloads at import time (torch/_rocm_init.py)
+    preload_shortnames = [
+        "amd_comgr", "amdhip64", "rocprofiler-sdk", "rocprofiler-sdk-roctx",
+        "roctracer64", "roctx64", "hiprtc", "hipblas", "hipfft", "hiprand",
+        "hipsparse", "hipsparselt", "hipsolver", "rccl", "hipblaslt", "miopen",
+        "hipdnn", "rocm_sysdeps_liblzma", "rocm-openblas", "rocm_smi64",
+    ]
+
+    dirs = []
+    for shortname in preload_shortnames:
+        try:
+            for path in rocm_sdk.find_libraries(shortname):
+                if str(path.parent) not in dirs:
+                    dirs.append(str(path.parent))
+        except Exception:
+            pass
+    if not dirs:
+        return
+
+    existing = [d for d in os.environ.get("LD_LIBRARY_PATH", "").split(":") if d]
+    missing = [d for d in dirs if d not in existing]
+    if missing:
+        os.environ["LD_LIBRARY_PATH"] = ":".join(missing + existing)
+
 class Model_TPMixin:
 
     def __init__(self):
@@ -57,6 +101,10 @@ class Model_TPMixin:
         # to work okay here
         multiprocessing.set_start_method("spawn", force = True)
         torch.multiprocessing.set_sharing_strategy("file_system")
+
+        # torch_shm_manager (exec'd on first shared tensor) must be able to resolve
+        # the venv ROCm libs once file_system sharing is active
+        _ensure_shm_manager_rocm_env()
 
         # Backend args
         self.tp_backend = tp_backend
