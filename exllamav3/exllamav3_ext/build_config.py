@@ -6,6 +6,8 @@ ROCM_EXCLUDE_DIRS = set()
 
 ROCM_EXCLUDE_FILES = {
     'quant/exl3_gemv.cu', 'quant/exl3_gemv_int8.cu',
+    'quant/exl3_moe_coop.cu',
+    'hgemm_f16acc.cu',
 }
 CUDA_EXCLUDE_FILES = {
     'exl3_rocm_stubs.cpp',
@@ -41,7 +43,7 @@ def get_sources(sources_dir, is_rocm, base_dir = None):
     relative to it (setup.py), otherwise absolute (JIT loader)."""
 
     # CUDA-only instantiations: fused-MoE scheduler and int8-GEMV comp units
-    rocm_exclude_prefixes = ('exl3_gemv_int8_inst_',)
+    rocm_exclude_prefixes = ('exl3_gemv_int8_inst_', 'exl3_moe_coop_inst_')
 
     sources = []
     for root, _, files in os.walk(sources_dir):
