@@ -939,7 +939,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # f_threshold-1 instead of MAX_BSZN). Expert-range shards (CPU split, TP) are masked
         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
-        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
+        # ROCm: the fused bszN tier is the two-stage coop kernel (warp-matrix GEMV engines),
+        # not built on HIP; decline it so decode takes the exl3_moe tier below
+        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN and torch.version.hip is None
 
         # Routing
         if self.router_pre_norm:
@@ -989,8 +991,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
 
         # Torch/C++/fused path
+        # ROCm: bszn_eligible declines the coop tier on HIP, so every batch that would
+        # have taken it lands here (on CUDA the only ineligible batches are the large
+        # ones, bsz > MAX_BSZN, which this tier already covered)
         elif (
-            (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
+            not bszn_eligible or not self.is_quantized or
             self.config.infer_params.no_reconstruct or
             not (self.support_quant_paths or bszn_eligible)
         ):
