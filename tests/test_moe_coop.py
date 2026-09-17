@@ -12,6 +12,12 @@ import pytest
 import torch
 from exllamav3.ext import exllamav3_ext as ext
 
+# ROCm: the fused coop MoE kernel builds on the warp-matrix GEMV engines and is not ported
+pytestmark = pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="coop MoE kernel not built on ROCm",
+)
+
 DEV = torch.device(os.environ.get("EXL3_TEST_DEVICE", "cuda:0"))
 ACTS = {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}
 
