@@ -1,15 +1,18 @@
 # exllamav3 ROCm/Triton work notes
 
-> **POST-REFACTOR NOTE (current truth, updated for the post-v1.4.6 rebase):** The fork
+> **POST-REFACTOR NOTE (current truth, updated for the v1.5.0 rebase):** The fork
 > architecture changed fundamentally. The current lines are:
 > - `staging` (= `origin/staging`, upstreamable PR line): rebased onto current
->   upstream/master (past v1.4.6). Upstream's ENTIRE C++ extension builds on HIP and
->   binds, including the newest upstream kernels (PLE, n-gram, KDA, grouped norm).
->   The Triton EXL3 linear line is DELETED. Platform seams: the lock-cascade inner
->   (`exl3_gemm_inner_rocm.cuh`), compat headers, bindings HIP branch, plus
->   cross-platform kernel fixes (norm.cu half-gate rows, rope reduction). The fused
->   MoE and mgemm paths are ENABLED (capability-routed). 16 commits over upstream/master;
->   packaging carries a `rocm` extra (pyproject, AMD TheRock index) for one-command installs.
+>   upstream/master (v1.5.0, MoE two-stage coop kernel + dense-quantizer dispatch era).
+>   Upstream's C++ extension builds on HIP and binds. Platform seams: the lock-cascade
+>   inner (`exl3_gemm_inner_rocm.cuh`, now with `size_n_stride` column-slice support),
+>   compat headers, bindings HIP branch, cross-platform kernel fixes. NOT ported to HIP
+>   (stubbed in `exl3_rocm_stubs.cpp`, excluded in `build_config.py`): the warp-matrix
+>   GEMV engines (`exl3_gemv*.cu`), the fused MoE coop kernel (`exl3_moe_coop.cu` +
+>   comp units — decode routes through the fused `exl3_moe` tier via the
+>   `bszn_eligible` seam in `block_sparse_mlp.py`), and the sm_120 `hgemm_f16acc`
+>   (`hgemm_recon` falls back to plain `hgemm`). 21 commits over upstream/master;
+>   packaging carries a `rocm` extra (pyproject, AMD TheRock index).
 > - `integration` (= `staging` + this file + bench history): the test/deploy branch.
 > - `backup/integration-old`, `rocm-plumbing` (+ `backup/*`), `local/perf-45`,
 >   `rocm-perf`, exploration branches: ARCHIVED history. The perf campaign records
