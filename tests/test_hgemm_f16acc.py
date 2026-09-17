@@ -5,10 +5,17 @@ import torch
 from exllamav3.ext import exllamav3_ext as ext
 
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
-    reason="requires Ampere or later",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+        reason="requires Ampere or later",
+    ),
+    # ROCm: the f16acc kernel is an sm_120 PTX specialization and is not built on HIP
+    pytest.mark.skipif(
+        torch.version.hip is not None,
+        reason="f16acc kernel not built on ROCm",
+    ),
+]
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
