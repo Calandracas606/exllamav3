@@ -59,4 +59,90 @@ bool exl3_gemv_int8
 
 int exl3_gemv_int8_max_k(int) { return 0; }
 
+// hgemm_f16acc.cu is the sm_120 PTX tensor-core GEMM (GeForce fp16-accumulator path); not
+// ported. hgemm.cu falls back to rocBLAS when hgemm_f16acc_try returns false. hgemm_recon
+// (defined there upstream) reduces to plain hgemm under the stub.
+#include "hgemm.cuh"
+
+bool hgemm_f16acc_try(const at::Tensor&, const at::Tensor&, at::Tensor&) { return false; }
+
+void hgemm_f16acc(at::Tensor, at::Tensor, at::Tensor)
+{
+    TORCH_CHECK(false, "hgemm_f16acc: not built on ROCm (the fp32-accumulator path covers it)");
+}
+
+int hgemm_f16acc_status(int) { return 0; }
+
+void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
+{
+    hgemm(a, b, c);
+}
+
+// Fused coop MoE kernel (exl3_moe_coop.cu) is not ported: it builds on the warp-matrix GEMV
+// engines. run_bszN routes through exl3_moe_coop_run, which callers reach only when
+// InferParams.use_mgemm() is true (declined on HIP), so the run stub fails loudly if reached.
+// prepare must return rather than throw: the BC_BlockSparseMLP constructor calls it on every
+// platform, and its result is never dereferenced when the coop path is declined.
+#include "quant/exl3_moe_coop.cuh"
+
+MoeCoopParams exl3_moe_coop_prepare
+(
+    int,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const c10::optional<at::Tensor>&,
+    const c10::optional<at::Tensor>&,
+    const c10::optional<at::Tensor>&,
+    int, int, int,
+    bool, bool,
+    int, float,
+    bool,
+    at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,      // had_g, had_u, gu_g, gu_u
+    at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,      // act_out, d_out, ctr, out
+    const c10::optional<at::Tensor>&,                        // sh_gate_w
+    int&, int&, int&
+)
+{
+    return MoeCoopParams{};
+}
+
+void exl3_moe_coop_run
+(
+    MoeCoopParams, int, int, int,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const c10::optional<at::Tensor>&
+)
+{
+    TORCH_CHECK(false, "exl3_moe_coop_run: coop MoE kernel is not built on ROCm (use_mgemm declines the path)");
+}
+
+void exl3_moe_coop_launch(const MoeCoopParams&, int, int, int, int, cudaStream_t)
+{
+    TORCH_CHECK(false, "exl3_moe_coop_launch: coop MoE kernel is not built on ROCm");
+}
+
+void exl3_moe_coop
+(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    int, int, int,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const c10::optional<at::Tensor>&,
+    const c10::optional<at::Tensor>&,
+    const c10::optional<at::Tensor>&,
+    int, int, int,
+    bool, bool,
+    int, float,
+    bool,
+    at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,      // had_g, had_u, gu_g, gu_u
+    at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,      // act_out, d_out, ctr, out
+    const c10::optional<at::Tensor>&,
+    const c10::optional<at::Tensor>&
+)
+{
+    TORCH_CHECK(false, "exl3_moe_coop: coop MoE kernel is not built on ROCm");
+}
+
 #endif

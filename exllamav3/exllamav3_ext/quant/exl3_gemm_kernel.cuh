@@ -50,7 +50,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     {
         exl3_gemm_kernel_inner
         <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
-        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks, svh, inner_sh);
+        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks, svh, 0, inner_sh);
 
         A_ += 16 * size_k;
         if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);

@@ -10,7 +10,12 @@
 #include "../util.cuh"
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
+// platform inner: CUDA keeps the ptx tensor-core pipeline, HIP the lock-cascade inner
+#if defined(USE_ROCM)
+#include "exl3_gemm_inner_rocm.cuh"
+#else
 #include "exl3_gemm_inner.cuh"
+#endif
 #include "exl3_devctx.cuh"
 #include "../ptx.cuh"
 

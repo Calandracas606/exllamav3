@@ -132,11 +132,13 @@ static QtLaunch qt_launch(int device, int K, int cb, int L)
     const auto& instances = optimized ? quantize_tiles_optimized_instances : quantize_tiles_kernel_instances;
     const auto& instances_l160 = optimized ? quantize_tiles_optimized_instances_l160 : quantize_tiles_kernel_instances_l160;
     auto kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_l160[K - 1];
-    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    // nvcc accepts an implicit function-pointer to const void* here; clang does not
+    const void* kernel_ptr = (const void*) kernel;
+    cuda_check(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
     cudaFuncAttributes attr;
-    cuda_check(cudaFuncGetAttributes(&attr, kernel));
+    cuda_check(cudaFuncGetAttributes(&attr, kernel_ptr));
     int blocks_per_sm;
-    cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, attr.maxThreadsPerBlock, shmem));
+    cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel_ptr, attr.maxThreadsPerBlock, shmem));
     return {optimized, kernel, attr.maxThreadsPerBlock, shmem, blocks_per_sm};
 }
 
