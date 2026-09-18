@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Callable
+import os
 import torch
 
 from ..modules.attn import prepare_for_attn
@@ -109,6 +110,18 @@ class Model_LSMixin(ABC):
 
         recurrent_states = params.get("recurrent_states")
 
+        # Per device: the budget the memory fraction enforces, and the largest transient any
+        # measuring forward has needed there. A module's forward only proves that ITS transient
+        # still fits; every module already on the device needs its own at runtime, so a device
+        # is closed when its remaining headroom no longer covers the largest one seen
+        device_budget = {}
+        max_transient = {}
+        # Physical margin on top of the largest measured transient: the measure is per module,
+        # while a real forward also carries what the caller keeps live around it (recurrent
+        # test states, gathered embeddings, allocator slack), so a device packed to exactly one
+        # transient of headroom fails on the first real chunk
+        autosplit_margin = int(os.environ.get("EXL3_AUTOSPLIT_MARGIN_MB", 256)) << 20
+
         with ProgressBar(f"Loading (LS)" if progressbar else None, len(modules)) as progress:
 
             for idx, module in enumerate(modules):
@@ -144,10 +157,14 @@ class Model_LSMixin(ABC):
                             i = active_devices[current_device_i]
                             touched_devices.append(i)
                             i = active_devices[current_device_i]
+                            # Triton launches on the thread's current device (see
+                            # Module.prepare_for_device)
+                            if torch.version.hip:
+                                torch.cuda.set_device(i)
                             if reserve_per_device is not None:
-                                set_memory_fraction_reserve(reserve_per_device[i], i)
+                                device_budget[i] = set_memory_fraction_reserve(reserve_per_device[i], i)
                             elif use_per_device is not None:
-                                set_memory_fraction_use(use_per_device[i], i)
+                                device_budget[i] = set_memory_fraction_use(use_per_device[i], i)
                             else:
                                 raise RuntimeError("Logic error")
 
@@ -177,10 +194,45 @@ class Model_LSMixin(ABC):
                         # attention path, so any dequant temporaries a quantized cache layer
                         # still needs are allocated (and accounted) here
                         if self.caps.get("autosplit_load_fwd", True) and not autosplit_no_forward:
+                            measure = load_device.type == "cuda"
+                            if measure:
+                                torch.cuda.reset_peak_memory_stats(load_device)
+                                alloc_before = torch.cuda.memory_allocated(load_device)
                             dummy_state = module.prepare_for_device(dummy_state, params)
                             dummy_state = module.forward(dummy_state, params)
                             for sm in module:
                                 sm.autosplit_extra_measure(params)
+                            if measure:
+                                i = load_device.index
+                                transient = max(0, torch.cuda.max_memory_allocated(load_device) - alloc_before)
+                                # print(f"{module.key}: {transient,:}")
+
+                                max_transient[i] = max(max_transient.get(i, 0), transient)
+                                # Models with mixed layer type and dramatically different transient memory requirements
+                                # per layer break the assumption that if layer n fits and subsequently layer n+1 also
+                                # fits, then layer n will continue to work even with the weights of layer n+1 loaded
+                                if torch.cuda.memory_allocated(load_device) + max_transient[i] > device_budget[i]:
+                                    raise torch.cuda.OutOfMemoryError(
+                                        f"autosplit: cuda:{i} has no headroom left for the largest "
+                                        f"transient measured on it ({max_transient[i] >> 20} MiB)"
+                                    )
+                                # The same check against the device itself: a split budget at or
+                                # above the card's size plans against VRAM the CUDA context, the
+                                # loaded kernels and other processes hold (several hundred MiB),
+                                # and a load that passes the budget check then fails on the first
+                                # real forward. What the largest transient can still draw on is the
+                                # free device memory plus the allocator's reserved-but-unallocated
+                                # pool
+                                free_now, _ = torch.cuda.mem_get_info(load_device)
+                                reusable = free_now + torch.cuda.memory_reserved(load_device) - \
+                                    torch.cuda.memory_allocated(load_device)
+                                if reusable < max_transient[i] + autosplit_margin:
+                                    raise torch.cuda.OutOfMemoryError(
+                                        f"autosplit: cuda:{i} has {reusable >> 20} MiB of physical headroom "
+                                        f"left, below the largest transient measured on it "
+                                        f"({max_transient[i] >> 20} MiB) plus the {autosplit_margin >> 20} MiB "
+                                        f"margin (EXL3_AUTOSPLIT_MARGIN_MB)"
+                                    )
 
                         # Account for max_output_factor after last layer
                         extra_dummy_out_states = None
