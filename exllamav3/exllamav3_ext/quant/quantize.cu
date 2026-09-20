@@ -289,7 +289,9 @@ void quantize_tiles_frac
     const int num_tiles = input_tiles.size(0);
     if (!num_tiles) return;
     const int shmem = L * sizeof(half) + 32 * sizeof(int) + 128;
-    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    // nvcc accepts an implicit function-pointer to const void* here; clang does not
+    const void* kernel_ptr = (const void*) kernel;
+    cuda_check(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
     const int max_batch_size = (int) MIN(temp_costs.size(0), temp_edges.size(0));
     for (int batch_i = 0; batch_i < num_tiles; batch_i += max_batch_size)
     {

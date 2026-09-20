@@ -5,7 +5,7 @@
 #include <ATen/hip/HIPContext.h>
 #include "util.h"
 #include "util_hip.cuh"
-#include "quant/exl3_devctx.cuh"
+#include "quant/exl3_devctx_hip.cuh"
 #include <limits>
 
 /*

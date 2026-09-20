@@ -14,7 +14,9 @@
 bool exl3_gemv_try_launch
 (
     void**,
-    int, int, int, int, int,
+    int, int, int, int,
+    bool,
+    int,
     bool, bool,
     int,
     cudaStream_t,
@@ -38,6 +40,36 @@ void exl3_gemv
 )
 {
     TORCH_CHECK(false, "exl3_gemv: direct GEMV entry point is not built on ROCm (the regular exl3_gemm kernel covers these shapes)");
+}
+
+// Half-integer-bitrate selector instances (comp_units/exl3_gemv_half_inst.cu) are
+// CUDA-only; try_launch always declines before reaching it on HIP
+void* exl3_gemv_select_kernel_half(int, bool, int, int, bool) { return nullptr; }
+
+// Cooperative BC MoE kernel (quant/exl3_moe_coop.cu) is CUDA-only; the python layer
+// routes around it (see 887f6bd1 and block_sparse_mlp.py)
+void exl3_moe_coop
+(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    int, int, int,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const c10::optional<at::Tensor>&,
+    const c10::optional<at::Tensor>&,
+    const c10::optional<at::Tensor>&,
+    float, float, float,
+    bool, bool,
+    int,
+    float,
+    bool,
+    at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
+    at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
+    const c10::optional<at::Tensor>&,
+    const c10::optional<at::Tensor>&
+)
+{
+    TORCH_CHECK(false, "exl3_moe_coop: cooperative BC MoE kernel is not built on ROCm");
 }
 
 bool exl3_gemv_int8_enabled() { return false; }
@@ -145,14 +177,14 @@ MoeCoopParams exl3_moe_coop_prepare
     const c10::optional<at::Tensor>&,
     const c10::optional<at::Tensor>&,
     const c10::optional<at::Tensor>&,
-    int, int, int,
+    float, float, float,
     bool, bool,
     int, float,
     bool,
     at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,      // had_g, had_u, gu_g, gu_u
     at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,      // act_out, d_out, ctr, out
     const c10::optional<at::Tensor>&,                        // sh_gate_w
-    int&, int&, int&
+    float&, float&, int&
 )
 {
     return MoeCoopParams{};
@@ -160,7 +192,7 @@ MoeCoopParams exl3_moe_coop_prepare
 
 void exl3_moe_coop_run
 (
-    MoeCoopParams, int, int, int,
+    MoeCoopParams, float, float, int,
     const at::Tensor&, const at::Tensor&, const at::Tensor&,
     const c10::optional<at::Tensor>&
 )

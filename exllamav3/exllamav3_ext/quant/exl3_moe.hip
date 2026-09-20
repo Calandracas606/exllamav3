@@ -10,13 +10,14 @@ namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util_hip.cuh"
 #include "comp_units/exl3_moe_instances_hip.cuh"
+#include "bits_k.cuh"
 // 8 KB matches exl3_gemm_inner_rocm.cuh's SMEM_MAX (exl3_moe_common.cuh's 90 KB
 // fallback would exceed gfx1100's LDS)
 #if defined(USE_ROCM)
 #undef SMEM_MAX
 #define SMEM_MAX (8 * 1024)
 #endif
-#include "exl3_devctx.cuh"
+#include "exl3_devctx_hip.cuh"
 #include <set>
 
 int exl3_moe_max_concurrency(int device)
@@ -156,9 +157,9 @@ void exl3_moe
 
     const int act_function,
 
-    const int K_gate,
-    const int K_up,
-    const int K_down,
+    const float K_gate,
+    const float K_up,
+    const float K_down,
 
     const at::Tensor& gate_ptrs_trellis,
     const at::Tensor& gate_ptrs_suh,
@@ -248,8 +249,13 @@ void exl3_moe
 
     // TORCH_CHECK(act_function == MOE_ACT_SILU, "MoE kernel: Only SiLU is currently supported");
 
+    // Bitrates: compile-time instances for uniform integer K, the runtime-switch instance (K = 0) otherwise; the
+    // kernel receives the rates in half-bit units (see bits_k.cuh)
+    const int K2_gate = k2_from_K(K_gate), K2_up = k2_from_K(K_up), K2_down = k2_from_K(K_down);
+    TORCH_CHECK(gate_mul1 || (K2_gate % 2 == 0 && K2_up % 2 == 0 && K2_down % 2 == 0),
+                "exl3_moe: half-integer bitrates require the mul1 codebook");
     int K = 0;
-    if (K_gate == K_up && K_up == K_down) K = K_gate;
+    if (K2_gate == K2_up && K2_up == K2_down && K2_gate % 2 == 0) K = K2_gate / 2;
 
     TORCH_CHECK_DIM(gate_ptrs_trellis, 1);
     TORCH_CHECK(gate_ptrs_trellis.size(0) == num_experts, "Number of gate tensors doesn't match num_experts");
@@ -268,6 +274,10 @@ void exl3_moe
     int num_sms = DevCtx::instance().get_num_sms(device);
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);
+    // Every MoE instantiation fits in 44 KB (TILESIZE_N caps at 256, unlike the GEMM's 512),
+    // so clamping the request to the device limit never excludes a shape here; it only stops
+    // Turing's 64 KB cap from rejecting the fixed 90 KB ask.
+    int smem_max = DevCtx::instance().get_smem_request(device);
 
     // Launch. All blocks of the grid must be co-resident for the group barriers, so groups * width <= num_sms.
     // With a known number of active experts, launch only as many groups as there are experts and widen them to
@@ -303,7 +313,7 @@ void exl3_moe
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
     {
-        hipFuncSetAttribute((const void*) kernel, hipFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        hipFuncSetAttribute((const void*) kernel, hipFuncAttributeMaxDynamicSharedMemorySize, smem_max);
         moe_kernel_attr_set[device].insert((void*) kernel);
         cuda_check(hipPeekAtLastError());
     }
@@ -357,9 +367,9 @@ void exl3_moe
         (void*) &num_groups,
         (void*) &act_limit,
         (void*) &act_function,
-        (void*) &K_gate,
-        (void*) &K_up,
-        (void*) &K_down,
+        (void*) &K2_gate,
+        (void*) &K2_up,
+        (void*) &K2_down,
         (void*) &locks,
         &_output_scratch,
         &_fused_base,
@@ -373,7 +383,7 @@ void exl3_moe
         grid_dim,
         block_dim,
         kernelArgs,
-        SMEM_MAX,
+        smem_max,
         stream
     );
 

@@ -15,7 +15,9 @@
 bool exl3_gemv_try_launch
 (
     void**,
-    int, int, int, int, int,
+    int, int, int, int,
+    bool,
+    int,
     bool, bool,
     int,
     hipStream_t,
@@ -39,6 +41,36 @@ void exl3_gemv
 )
 {
     TORCH_CHECK(false, "exl3_gemv: direct GEMV entry point is not built on ROCm (the regular exl3_gemm kernel covers these shapes)");
+}
+
+// Half-integer-bitrate selector instances (comp_units/exl3_gemv_half_inst.cu) are
+// CUDA-only; try_launch always declines before reaching it on HIP
+void* exl3_gemv_select_kernel_half(int, bool, int, int, bool) { return nullptr; }
+
+// Cooperative BC MoE kernel (quant/exl3_moe_coop.cu) is CUDA-only; the python layer
+// routes around it (see 887f6bd1 and block_sparse_mlp.py)
+void exl3_moe_coop
+(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    int, int, int,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const c10::optional<at::Tensor>&,
+    const c10::optional<at::Tensor>&,
+    const c10::optional<at::Tensor>&,
+    float, float, float,
+    bool, bool,
+    int,
+    float,
+    bool,
+    at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
+    at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
+    const c10::optional<at::Tensor>&,
+    const c10::optional<at::Tensor>&
+)
+{
+    TORCH_CHECK(false, "exl3_moe_coop: cooperative BC MoE kernel is not built on ROCm");
 }
 
 bool exl3_gemv_int8_enabled() { return false; }
@@ -79,6 +111,57 @@ void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
     hgemm(a, b, c);
 }
 
+// Deterministic int8 router projection (routing_gemm.cu) and the tiled hyperconnection
+// mix (hc_mix_tiled.cu) build on the Ozaki det_gemm stack (cp.async / ldmatrix / mma.sync
+// PTX), not ported. routing_gemv declines via the fits stub; hyperconnections.py gates
+// the tiled path on !torch.version.hip, so the tiled stubs are unreachable
+#include "routing_hip.cuh"
+
+bool routing_gemm_det_fits(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&)
+{
+    return false;
+}
+
+void routing_gemm_det_(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, hipStream_t)
+{
+    TORCH_CHECK(false, "routing_gemm_det_: deterministic router GEMM is not built on ROCm");
+}
+
+void routing_gemm_det(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor)
+{
+    TORCH_CHECK(false, "routing_gemm_det: deterministic router GEMM is not built on ROCm");
+}
+
+void det_quant_weight(const at::Tensor&, at::Tensor, at::Tensor)
+{
+    TORCH_CHECK(false, "det_quant_weight: deterministic router tables are not built on ROCm");
+}
+
+void det_math_test(const at::Tensor&, at::Tensor)
+{
+    TORCH_CHECK(false, "det_math_test: deterministic router GEMM is not built on ROCm");
+}
+
+#include "hc_mix.cuh"
+
+int gr_mix_tiled_slices(int, int, int)
+{
+    TORCH_CHECK(false, "gr_mix_tiled_slices: tiled hyperconnection mix is not built on ROCm");
+    return 0;
+}
+
+void gr_mix_tiled
+(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,   // streams, w, proj_i8, proj_sb
+    const at::Tensor&, const at::Tensor&,                                          // up_i8, up_sb
+    double, int,                                                                    // rms_eps, M
+    at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,                    // dm_part, ss_part, rmr, t_i8, t_s
+    c10::optional<at::Tensor>, at::Tensor                                          // post, mixed
+)
+{
+    TORCH_CHECK(false, "gr_mix_tiled: tiled hyperconnection mix is not built on ROCm");
+}
+
 // Fused coop MoE kernel (exl3_moe_coop.cu) is not ported: it builds on the warp-matrix GEMV
 // engines. run_bszN routes through exl3_moe_coop_run, which callers reach only when
 // InferParams.use_mgemm() is true (declined on HIP), so the run stub fails loudly if reached.
@@ -95,14 +178,14 @@ MoeCoopParams exl3_moe_coop_prepare
     const c10::optional<at::Tensor>&,
     const c10::optional<at::Tensor>&,
     const c10::optional<at::Tensor>&,
-    int, int, int,
+    float, float, float,
     bool, bool,
     int, float,
     bool,
     at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,      // had_g, had_u, gu_g, gu_u
     at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,      // act_out, d_out, ctr, out
     const c10::optional<at::Tensor>&,                        // sh_gate_w
-    int&, int&, int&
+    float&, float&, int&
 )
 {
     return MoeCoopParams{};
@@ -110,7 +193,7 @@ MoeCoopParams exl3_moe_coop_prepare
 
 void exl3_moe_coop_run
 (
-    MoeCoopParams, int, int, int,
+    MoeCoopParams, float, float, int,
     const at::Tensor&, const at::Tensor&, const at::Tensor&,
     const c10::optional<at::Tensor>&
 )

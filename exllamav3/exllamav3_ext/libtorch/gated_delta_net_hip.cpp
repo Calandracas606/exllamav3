@@ -188,7 +188,7 @@ void BC_GatedDeltaNetSplit::set_qkvz_bundle
     at::Tensor ptrs_suh,
     at::Tensor ptrs_svh,
     at::Tensor meta,
-    int K,
+    float K,
     bool mcg,
     bool mul1
 )

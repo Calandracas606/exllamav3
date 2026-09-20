@@ -8,7 +8,7 @@
 #include "util.h"
 #include "util_hip.cuh"
 #include "hip_drv.h"
-#include "quant/exl3_devctx.cuh"
+#include "quant/exl3_devctx_hip.cuh"
 
 //#define GRAPHDEBUG 1
 

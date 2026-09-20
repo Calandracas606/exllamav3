@@ -8,7 +8,7 @@
 #include "util.h"
 #include "util_hip.cuh"
 #include <algorithm>
-#include "quant/exl3_devctx.cuh"
+#include "quant/exl3_devctx_hip.cuh"
 
 #define G_MAX 16
 #define PAGE_SIZE 256

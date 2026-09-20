@@ -11,7 +11,7 @@
 #else
 #include "exl3_gemm_inner_hip.cuh"
 #endif
-#include "exl3_devctx.cuh"
+#include "exl3_devctx_hip.cuh"
 
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
@@ -51,7 +51,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     while (size_m_ > 0)
     {
         exl3_gemm_kernel_inner
-        <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
+        <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
         (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks, svh, 0, inner_sh);
 
         A_ += 16 * size_k;
@@ -252,7 +252,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 int lock_offs = blockIdx.z * size_n / 128;
 
                 exl3_gemm_kernel_inner
-                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
+                <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
                 (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr, n_stride_j, inner_sh);
             }
 

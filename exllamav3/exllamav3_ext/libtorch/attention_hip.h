@@ -44,6 +44,7 @@ struct BC_Attention
     int num_q_heads;
     int num_kv_heads;
     int head_dim;
+    int v_head_dim;         // output lanes per head; == head_dim unless V is zero-padded in the cache
     int hidden_size;
     int hidden_size_padded;
     int page_size;
@@ -60,7 +61,7 @@ struct BC_Attention
     c10::optional<at::Tensor> kv_ptrs_trellis;
     c10::optional<at::Tensor> kv_ptrs_suh;
     c10::optional<at::Tensor> kv_ptrs_svh;
-    int kv_K;
+    float kv_K;
     bool kv_mcg;
     bool kv_mul1;
     std::shared_ptr<BC_LinearEXL3> o_proj;
@@ -80,7 +81,7 @@ struct BC_Attention
     c10::optional<at::Tensor> qg_ptrs_trellis;
     c10::optional<at::Tensor> qg_ptrs_suh;
     c10::optional<at::Tensor> qg_ptrs_svh;
-    int qg_K;
+    float qg_K;
     bool qg_mcg;
     bool qg_mul1;
 
@@ -92,7 +93,7 @@ struct BC_Attention
     c10::optional<at::Tensor> qkv_ptrs_suh;      // per source
     c10::optional<at::Tensor> qkv_ptrs_svh;
     c10::optional<at::Tensor> qkv_meta;
-    int qkv_K;
+    float qkv_K;
     bool qkv_mcg;
     bool qkv_mul1;
     at::Tensor qkv_size_n, qkv_n_stride, qkv_had_src;   // device int32, per slice
@@ -197,6 +198,7 @@ struct BC_Attention
         int num_q_heads,
         int num_kv_heads,
         int head_dim,
+        int v_head_dim,
         int hidden_size,
         int hidden_size_padded,
         int page_size,
@@ -206,7 +208,7 @@ struct BC_Attention
         c10::optional<at::Tensor> kv_ptrs_trellis,
         c10::optional<at::Tensor> kv_ptrs_suh,
         c10::optional<at::Tensor> kv_ptrs_svh,
-        int kv_K,
+        float kv_K,
         bool kv_mcg,
         bool kv_mul1,
         std::shared_ptr<BC_LinearEXL3> o_proj,
@@ -218,14 +220,14 @@ struct BC_Attention
         c10::optional<at::Tensor> qg_ptrs_trellis,
         c10::optional<at::Tensor> qg_ptrs_suh,
         c10::optional<at::Tensor> qg_ptrs_svh,
-        int qg_K,
+        float qg_K,
         bool qg_mcg,
         bool qg_mul1,
         c10::optional<at::Tensor> qkv_ptrs_trellis,
         c10::optional<at::Tensor> qkv_ptrs_suh,
         c10::optional<at::Tensor> qkv_ptrs_svh,
         c10::optional<at::Tensor> qkv_meta,
-        int qkv_K,
+        float qkv_K,
         bool qkv_mcg,
         bool qkv_mul1,
         c10::optional<at::Tensor> q_norm,
