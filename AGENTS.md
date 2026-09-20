@@ -1,20 +1,28 @@
 # exllamav3 ROCm/Triton work notes
 
-> **POST-REFACTOR NOTE (current truth, updated for the post-v1.4.6 rebase):** The fork
+> **POST-REFACTOR NOTE (current truth, updated for the v1.5.0 rebase):** The fork
 > architecture changed fundamentally. The current lines are:
 > - `staging` (= `origin/staging`, upstreamable PR line): rebased onto current
->   upstream/master (past v1.4.6). Upstream's ENTIRE C++ extension builds on HIP and
->   binds, including the newest upstream kernels (PLE, n-gram, KDA, grouped norm).
->   The Triton EXL3 linear line is DELETED. Platform seams: the lock-cascade inner
->   (`exl3_gemm_inner_rocm.cuh`), compat headers, bindings HIP branch, plus
->   cross-platform kernel fixes (norm.cu half-gate rows, rope reduction). The fused
->   MoE and mgemm paths are ENABLED (capability-routed). 16 commits over upstream/master;
->   packaging carries a `rocm` extra (pyproject, AMD TheRock index) for one-command installs.
+>   upstream/master (v1.5.0, MoE two-stage coop kernel + dense-quantizer dispatch era).
+>   Upstream's C++ extension builds on HIP and binds. Platform seams: the lock-cascade
+>   inner (`exl3_gemm_inner_rocm.cuh`, now with `size_n_stride` column-slice support),
+>   compat headers, bindings HIP branch, cross-platform kernel fixes. NOT ported to HIP
+>   (stubbed in `exl3_rocm_stubs.cpp`, excluded in `build_config.py`): the warp-matrix
+>   GEMV engines (`exl3_gemv*.cu`), the fused MoE coop kernel (`exl3_moe_coop.cu` +
+>   comp units — decode routes through the fused `exl3_moe` tier via the
+>   `bszn_eligible` seam in `block_sparse_mlp.py`), and the sm_120 `hgemm_f16acc`
+>   (`hgemm_recon` falls back to plain `hgemm`). 21 commits over upstream/master;
+>   packaging carries a `rocm` extra (pyproject, AMD TheRock index).
 > - `integration` (= `staging` + this file + bench history): the test/deploy branch.
 > - `backup/integration-old`, `rocm-plumbing` (+ `backup/*`), `local/perf-45`,
 >   `rocm-perf`, exploration branches: ARCHIVED history. The perf campaign records
 >   below describe the OLD architecture (Triton linear line, fork twins) and are kept
 >   as history; do not follow their instructions verbatim.
+> - **Base policy: fork branches track `upstream/master`, NEVER `upstream/dev`** (upstream
+>   force-pushes dev; its history is unstable). `local/upstream-dev-adaptation` preserves a
+>   dev-based rebase attempt (det_gemm PTX guards, dflash2 top-k acq_rel arrival-counter fix,
+>   hc_mix launch-syntax fix, scalar __ldcg shim) for when master absorbs those commits —
+>   the dflash2 race fix in particular will be needed then.
 > - `rocm-gfx1100-integration` remains FROZEN (old upstream PR, never touch).
 > The HIP inline-asm GEMV engine (45-tok/s campaign) lives on `local/perf-45` /
 > `rocm-perf` and is the candidate to replace/augment the native exl3_gemm decode path.
@@ -82,7 +90,12 @@ integration = merge(rocm-aiter, rocm-flydsl, triton-kernels) + this AGENTS.md + 
    --ignore=tests/test_ext_norm_.py --ignore=tests/test_mla.py
    --ignore=tests/test_dsa_kernels.py --ignore=tests/test_reconstruct_had.py
    --ignore=tests/test_dsv4_compress_kernel.py
-   --ignore=tests/test_triton_paged_overflow.py -q` → expect **486 passed / 68 skipped**
+   --ignore=tests/test_triton_paged_overflow.py
+   --ignore=tests/test_ngram_prefetch_.py -q` → expect **499 passed / 66 skipped**
+   (499/66 measured on the v1.5.0 master base 02aef45; test_ext_norm_ and test_kv_quant
+   now pass unmodified — their ignores are only kept for stability. triton_paged_overflow
+   has an order-dependent flake with kv_quant/ext_norm in one process; ngram_prefetch_
+   runs module-level code against a stub model on a hardcoded upstream-dev-box path)
 2. Generation identity: 3 prompts × ≥200 tokens, argmax, whole-step graphs on, every
    env kill switch toggled, vs the previous verified state.
 3. `bench_decode.py --model 27b --num-tokens 512` — median windowed steady-state.
