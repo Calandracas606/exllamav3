@@ -5,6 +5,7 @@ import torch
 import socket, contextlib
 import weakref
 import re
+import os, sys
 
 lock = threading.RLock()
 
@@ -98,8 +99,13 @@ class Cleanupper:
     atexit but called before Python starts tearing down objects/threads.
     """
 
+    # Every instance ever created, so an early orchestrated shutdown (see
+    # bypass_rocm_atexit_crash) can reach hooks registered on any of them
+    _instances: list = []
+
     def __init__(self):
         self.atexit_fns = []
+        Cleanupper._instances.append(self)
         weakref.finalize(self, self._shutdown)
 
     def register_atexit(self, fn):
@@ -108,6 +114,11 @@ class Cleanupper:
     def unregister_atexit(self, fn):
         if fn in self.atexit_fns:
             self.atexit_fns.remove(fn)
+
+    @classmethod
+    def shutdown_all(cls):
+        for instance in cls._instances:
+            instance._shutdown()
 
     def _shutdown(self):
         # Snapshot first: hooks commonly unregister themselves when called, and mutating the
@@ -119,6 +130,25 @@ class Cleanupper:
             except Exception:
                 import traceback
                 traceback.print_exc()
+
+
+def bypass_rocm_atexit_crash(status: int = 0) -> None:
+    """
+    Workaround for a TheRock ROCm (gfx1100, 7.14) teardown fault: after a TP session, the HSA
+    runtime's C-level atexit handler segfaults in AqlQueue::~AqlQueue (via hsa_shut_down called
+    from libamdhip64) during exit(), converting fully successful runs into exit code 139. The
+    fault happens after all Python work is done, so leaving through os._exit instead skips only
+    the faulting C-level atexit chain. Cleanupper hooks (model unload, TP context teardown) run
+    first, and this is a no-op on non-HIP platforms, which keep the normal exit path.
+    """
+
+    if not torch.version.hip:
+        return
+
+    Cleanupper.shutdown_all()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(status)
 
 
 def install_parent_death_signal() -> bool:
