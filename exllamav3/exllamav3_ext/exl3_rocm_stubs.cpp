@@ -78,6 +78,57 @@ void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
     hgemm(a, b, c);
 }
 
+// Deterministic int8 router projection (routing_gemm.cu) and the tiled hyperconnection
+// mix (hc_mix_tiled.cu) build on the Ozaki det_gemm stack (cp.async / ldmatrix / mma.sync
+// PTX), not ported. routing_gemv declines via the fits stub; hyperconnections.py gates
+// the tiled path on !torch.version.hip, so the tiled stubs are unreachable
+#include "routing.cuh"
+
+bool routing_gemm_det_fits(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&)
+{
+    return false;
+}
+
+void routing_gemm_det_(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, cudaStream_t)
+{
+    TORCH_CHECK(false, "routing_gemm_det_: deterministic router GEMM is not built on ROCm");
+}
+
+void routing_gemm_det(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor)
+{
+    TORCH_CHECK(false, "routing_gemm_det: deterministic router GEMM is not built on ROCm");
+}
+
+void det_quant_weight(const at::Tensor&, at::Tensor, at::Tensor)
+{
+    TORCH_CHECK(false, "det_quant_weight: deterministic router tables are not built on ROCm");
+}
+
+void det_math_test(const at::Tensor&, at::Tensor)
+{
+    TORCH_CHECK(false, "det_math_test: deterministic router GEMM is not built on ROCm");
+}
+
+#include "hc_mix.cuh"
+
+int gr_mix_tiled_slices(int, int, int)
+{
+    TORCH_CHECK(false, "gr_mix_tiled_slices: tiled hyperconnection mix is not built on ROCm");
+    return 0;
+}
+
+void gr_mix_tiled
+(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,   // streams, w, proj_i8, proj_sb
+    const at::Tensor&, const at::Tensor&,                                          // up_i8, up_sb
+    double, int,                                                                    // rms_eps, M
+    at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,                    // dm_part, ss_part, rmr, t_i8, t_s
+    c10::optional<at::Tensor>, at::Tensor                                          // post, mixed
+)
+{
+    TORCH_CHECK(false, "gr_mix_tiled: tiled hyperconnection mix is not built on ROCm");
+}
+
 // Fused coop MoE kernel (exl3_moe_coop.cu) is not ported: it builds on the warp-matrix GEMV
 // engines. run_bszN routes through exl3_moe_coop_run, which callers reach only when
 // InferParams.use_mgemm() is true (declined on HIP), so the run stub fails loudly if reached.

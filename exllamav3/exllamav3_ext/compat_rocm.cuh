@@ -101,4 +101,11 @@ __device__ __forceinline__ __hip_bfloat16 float2bfloat16_rn(float f)
 // cost tables gate on this)
 #define QUANTIZE_TILES_SMEM_LIMIT 65536
 
+// HIP has no __ldcg for integer/float scalars (only its vector types); the L2-bypass
+// hint is not available on RDNA3. volatile keeps the cross-block partial reads from
+// being reordered around the arrival counter
+__device__ __forceinline__ float __ldcg(const float* p) { return *(const volatile float*) p; }
+__device__ __forceinline__ int __ldcg(const int* p) { return *(const volatile int*) p; }
+__device__ __forceinline__ unsigned int __ldcg(const unsigned int* p) { return *(const volatile unsigned int*) p; }
+
 #endif  // !defined(USE_ROCM) || defined(__HIPCC__)

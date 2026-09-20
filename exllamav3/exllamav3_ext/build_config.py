@@ -8,6 +8,7 @@ ROCM_EXCLUDE_FILES = {
     'quant/exl3_gemv.cu', 'quant/exl3_gemv_int8.cu',
     'quant/exl3_moe_coop.cu',
     'hgemm_f16acc.cu',
+    'routing_gemm.cu', 'hc_mix_tiled.cu',
 }
 CUDA_EXCLUDE_FILES = {
     'exl3_rocm_stubs.cpp',
