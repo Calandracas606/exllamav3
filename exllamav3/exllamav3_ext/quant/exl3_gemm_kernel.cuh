@@ -2,7 +2,13 @@
 
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
+// platform inner: CUDA keeps the ptx tensor-core pipeline, HIP the split-K
+// streaming inner
+#if defined(USE_ROCM)
+#include "exl3_gemm_inner_rocm.cuh"
+#else
 #include "exl3_gemm_inner.cuh"
+#endif
 #include "exl3_devctx.cuh"
 
 template<EXL3_GEMM_T_ARGS>
@@ -33,12 +39,18 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     int size_m_ = size_m;
     const half* A_ = A;
     void* C_ = C;
+    // column-tile staging: shared on HIP, null on CUDA
+#if defined(USE_ROCM)
+    __shared__ float inner_sh[EXL3_INNER_SH_FLOATS(TILESIZE_N)];
+#else
+    constexpr float* inner_sh = nullptr;
+#endif
 
     while (size_m_ > 0)
     {
         exl3_gemm_kernel_inner
         <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
-        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks, svh);
+        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks, svh, 0, inner_sh);
 
         A_ += 16 * size_k;
         if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
@@ -144,6 +156,12 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         bszm = bszm_sync;
     }
 
+#if defined(USE_ROCM)
+    __shared__ float inner_sh[EXL3_INNER_SH_FLOATS(TILESIZE_N)];
+#else
+    constexpr float* inner_sh = nullptr;
+#endif
+
     // Sliced mode: the entries are equal-width column slices of fewer source matrices, so the
     // input transform runs once per source (suh_list is per source, A_had holds one slab per
     // source) with every block cooperating, and each slice then reads its source's slab
@@ -233,7 +251,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 
                 exl3_gemm_kernel_inner
                 <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
-                (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
+                (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr, n_stride_j, inner_sh);
             }
 
             A_ += 16 * size_k;

@@ -234,6 +234,28 @@ python examples/chat.py -h
 
 Always adding more, stay tuned.
 
+For the test suite, `EXL_TEST_DEVICE` overrides the test device (e.g. `cuda:1`).
+
+
+### Experimental ROCm (AMD GPUs) support
+
+ROCm support is experimental and performance is significantly reduced compared to CUDA. The `rocm` extra installs the full stack — PyTorch (`torch`/`triton-rocm` from PyTorch's rocm7.14 index) plus the ROCm SDK and device kernels (from AMD's TheRock index) — as wheels into the venv; no system ROCm install is required, and the build discovers the SDK automatically (no environment variables). Linux only (PyTorch publishes no Windows rocm7.14 wheels). Like the CUDA flavors, `uv sync` builds in an isolated environment without visibility of `torch`, so the extension compiles at first import:
+
+```sh
+uv venv
+uv sync --extra rocm
+```
+
+For a precompiled extension, install the dependencies first and then build against them:
+
+```sh
+uv sync --extra rocm --no-install-project
+uv sync --extra rocm --no-build-isolation
+```
+
+The default device target is gfx1100 (RX 7900 XTX); all device targets are installed (torch 2.14 requires the full `rocm[device-all]` set), so no changes are needed for another GPU architecture.
+
+All kernels except the warp-matrix EXL3 GEMV engines build natively and inference runs through them; the EXL3 conversion flow is untested. Tested on gfx1100 (RX 7900 XTX).
 ## Conversion
 
 To convert a model to EXL3 format, use:

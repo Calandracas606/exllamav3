@@ -120,16 +120,25 @@ static QtLaunch qt_launch(int device, int K, int cb, int L)
     const auto* props = at::cuda::getDeviceProperties(device);
     const bool optimized = quantize_tiles_use_optimized(props->major, props->minor, K, cb);
     const int edges = 65536 >> K;
-    const int cost_arrays = optimized && K == 1 ? 1 : (K >= 2 ? 2 : 0);
+    int cost_arrays = optimized && K == 1 ? 1 : 0;
+#if defined(USE_ROCM)
+    // 64 KB-LDS devices (gfx1100): the K == 2 cost tables (64 KB) do not fit alongside the row
+    // buffers, so stage no tables and let the kernel's global-table path take over
+    if (K >= 2 && (size_t) 2 * edges * sizeof(half) + L * sizeof(half) + 64 + 128 <= QUANTIZE_TILES_SMEM_LIMIT) cost_arrays = 2;
+#else
+    if (K >= 2) cost_arrays = 2;
+#endif
     const int shmem = cost_arrays * edges * sizeof(half) + L * sizeof(half) + 64 + 128;
     const auto& instances = optimized ? quantize_tiles_optimized_instances : quantize_tiles_kernel_instances;
     const auto& instances_l160 = optimized ? quantize_tiles_optimized_instances_l160 : quantize_tiles_kernel_instances_l160;
     auto kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_l160[K - 1];
-    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    // nvcc accepts an implicit function-pointer to const void* here; clang does not
+    const void* kernel_ptr = (const void*) kernel;
+    cuda_check(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
     cudaFuncAttributes attr;
-    cuda_check(cudaFuncGetAttributes(&attr, kernel));
+    cuda_check(cudaFuncGetAttributes(&attr, kernel_ptr));
     int blocks_per_sm;
-    cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, attr.maxThreadsPerBlock, shmem));
+    cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel_ptr, attr.maxThreadsPerBlock, shmem));
     return {optimized, kernel, attr.maxThreadsPerBlock, shmem, blocks_per_sm};
 }
 

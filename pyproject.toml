@@ -32,6 +32,50 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+rocm = [
+    # Full Linux ROCm/HIP stack in the venv; no system ROCm install required. torch
+    # and triton-rocm come from PyTorch's rocm7.14 index (AMD's TheRock index stops
+    # at torch 2.13 for gfx1100 because its amd-torch-device-* wheels are stale);
+    # torch 2.14 drops the amd-torch-device-* dependency scheme entirely. The ROCm
+    # SDK wheels (runtime, libraries, compiler, device kernels) come from AMD's
+    # index, which hosts the originals (PyTorch's index only mirrors them via
+    # redirects that uv's lock resolver rejects). Linux-only because PyTorch's
+    # rocm7.14 index publishes no Windows torch wheels. Source mappings to the
+    # explicit AMD index only take effect for direct dependencies, so every
+    # package that exists solely on that index must be listed here; the device
+    # targets are the members of torch 2.14's rocm[device-all] requirement.
+    "torch==2.14.0+rocm7.14; platform_system == 'Linux'",
+    "triton-rocm~=3.8.0; platform_system == 'Linux'",
+    "rocm[libraries,devel,device-all]==7.14.1; platform_system == 'Linux'",
+    "rocm-sdk-core>=7.14; platform_system == 'Linux'",
+    "rocm-sdk-libraries>=7.14; platform_system == 'Linux'",
+    "rocm-sdk-devel>=7.14; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx908; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx90a; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx942; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx950; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1010; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1011; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1012; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1030; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1031; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1032; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1033; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1034; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1035; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1036; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1100; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1101; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1102; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1103; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1150; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1151; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1152; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1153; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1200; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1201; platform_system == 'Linux'",
+    "rocm-sdk-device-gfx1250; platform_system == 'Linux'",
+]
 eval = [
     "transformers>=4.50.0",
     "datasets",
@@ -98,6 +142,7 @@ conflicts = [
         { extra = "cu129" },
         { extra = "cu130" },
         { extra = "cu132" },
+        { extra = "rocm" },
     ],
 ]
 
@@ -109,8 +154,108 @@ torch = [
     { index = "pytorch-cu129", extra = "cu129" },
     { index = "pytorch-cu130", extra = "cu130" },
     { index = "pytorch-cu132", extra = "cu132" },
+    { index = "pytorch-rocm7.14", extra = "rocm" },
+]
+triton-rocm = [
+    { index = "pytorch-rocm7.14", extra = "rocm" },
+]
+rocm = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-core = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-libraries = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-devel = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx908 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx90a = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx942 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx950 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1010 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1011 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1012 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1030 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1031 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1032 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1033 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1034 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1035 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1036 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1100 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1101 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1102 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1103 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1150 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1151 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1152 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1153 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1200 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1201 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1250 = [
+    { index = "amd-rocm", extra = "rocm" },
 ]
 
+[[tool.uv.index]]
+name = "pytorch-rocm7.14"
+url = "https://download.pytorch.org/whl/rocm7.14"
+explicit = true
+
+[[tool.uv.index]]
+name = "amd-rocm"
+url = "https://repo.amd.com/rocm/whl-multi-arch/"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu124"
