@@ -7,9 +7,16 @@ feed ext.routing_std so that multi-row routing selects the same experts as the r
 that are not near-ties. Also checks the FMA-only transcendentals the routing activations use.
 """
 import sys, os, unittest
+import pytest
 import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.ext import exllamav3_ext as ext
+
+# ROCm: the deterministic int8 router GEMM (Ozaki det_gemm stack) is not built on HIP
+pytestmark = pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="deterministic router GEMM not built on ROCm",
+)
 
 DEVICE = torch.device("cuda:0")
 

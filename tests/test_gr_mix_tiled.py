@@ -5,9 +5,16 @@ row count and both module forms, agree with the cuBLAS GEMM path to the same tol
 bit-reproducible run to run (the property the TP replicated-routing design relies on).
 """
 import sys, os, unittest
+import pytest
 import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.modules.hyperconnections import GatedResidual
+
+# ROCm: the tiled deterministic mix (Ozaki det_gemm stack) is not built on HIP
+pytestmark = pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="tiled hyperconnection mix not built on ROCm",
+)
 
 DEVICE = torch.device("cuda:0")
 
