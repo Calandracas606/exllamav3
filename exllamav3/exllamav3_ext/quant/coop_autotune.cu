@@ -18,6 +18,7 @@
 
 #include "../util.cuh"
 #include "../util.h"
+#include "exl3_launch.h"
 
 //#define CACHEDEBUG 1
 
@@ -407,7 +408,7 @@ void measure_candidate_sample
     cuda_check(cudaEventRecord(start, stream));
     for (int i = 0; i < repeats; ++i)
     {
-        cuda_check(cudaLaunchCooperativeKernel
+        cuda_check(exl3_launch_grid_sync_kernel
         (
             candidate.kernel,
             dim3(candidate.num_sms, 1, candidate.concurrency),
@@ -465,7 +466,7 @@ void measure_stage
         set_kernel_attr_once(candidate.kernel, smem);
 
         // One untimed launch avoids first-use effects from contaminating the first measured round.
-        cuda_check(cudaLaunchCooperativeKernel
+        cuda_check(exl3_launch_grid_sync_kernel
         (
             candidate.kernel,
             dim3(candidate.num_sms, 1, candidate.concurrency),
@@ -607,7 +608,7 @@ bool CoopKernelAutotuner::launch_locked
     }
 
     set_kernel_attr_once(launch_config.kernel, smem);
-    cuda_check(cudaLaunchCooperativeKernel
+    cuda_check(exl3_launch_grid_sync_kernel
     (
         launch_config.kernel,
         dim3(launch_config.num_sms, 1, launch_config.concurrency),
@@ -641,7 +642,7 @@ CoopAutotuneLaunch CoopKernelAutotuner::launch
     {
         launch_cache[salted_hash] = launch_config;
         set_kernel_attr_once(launch_config.kernel, smem);
-        cuda_check(cudaLaunchCooperativeKernel
+        cuda_check(exl3_launch_grid_sync_kernel
         (
             launch_config.kernel,
             dim3(launch_config.num_sms, 1, launch_config.concurrency),
@@ -661,7 +662,7 @@ CoopAutotuneLaunch CoopKernelAutotuner::launch
     store_disk_cache(salted_hash, launch_config);
 
     set_kernel_attr_once(launch_config.kernel, smem);
-    cuda_check(cudaLaunchCooperativeKernel
+    cuda_check(exl3_launch_grid_sync_kernel
     (
         launch_config.kernel,
         dim3(launch_config.num_sms, 1, launch_config.concurrency),

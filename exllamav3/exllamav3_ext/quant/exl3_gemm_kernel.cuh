@@ -11,11 +11,24 @@
 #endif
 #include "exl3_devctx.cuh"
 
+#if defined(USE_ROCM)
+    // ROCm: lock-based sense-reversing grid barrier, valid under either launch mode (exl3_launch.h
+    // selects it; hipLaunchCooperativeKernel intermittently segfaults in libamdhip64 under large
+    // multi-device footprints, EXL3_COOP_LAUNCH=0 opts out). group_barrier matches grid.sync()
+    // semantics for the uniform, stream-serialized grids used here; co-residency is guaranteed by
+    // the cooperative launch, or by the plain launch clamping gridDim.z to 1.
+    #define EXL3_GRID_BARRIER() group_barrier(0, gridDim.x * gridDim.z, locks + BARRIER_LOCKS_OFFSET)
+#else
+    #define EXL3_GRID_BARRIER() grid.sync()
+#endif
+
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
 void exl3_gemm_kernel(EXL3_GEMM_ARGS)
 {
+#if !defined(USE_ROCM)
     auto grid = cg::this_grid();
+#endif
 
     // if (suh)
     {
@@ -32,7 +45,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
                 0.088388347648f  // 1/sqrt(128)
             );
 
-        grid.sync();
+        EXL3_GRID_BARRIER();
         A = A_had;
     }
 
@@ -58,7 +71,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
         size_m_ -= 16;
 
         if (size_m_ > 0 || svh)
-            grid.sync();
+            EXL3_GRID_BARRIER();
     }
 
     // if (svh)
