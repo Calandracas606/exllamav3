@@ -94,7 +94,16 @@ void run_cpu_reduce_jobs
     uint8_t* shbuf_ptr = (uint8_t*) shbuf;
     ReduceJob current_job;
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
+    // Liveness backstop for "a rank died without posting". The wait must tolerate cold-start first
+    // passes: ranks can spend minutes in Triton JIT compilation before the first collective, so the
+    // no-work deadline has to dwarf that (50 s was too short and wedged every cold first run when the
+    // ranks later reached their all_reduce with no helper left to serve it). Overridable for debugging.
+    int64_t wait_timeout_s = 900;
+    {
+        const char* env = std::getenv("EXL3_CPU_REDUCE_TIMEOUT");
+        if (env) wait_timeout_s = std::atoll(env);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(wait_timeout_s);
     while (true)
     {
         // Wait for next job. Jobs are pushed just-in-time by the master's dispatch loop, so the

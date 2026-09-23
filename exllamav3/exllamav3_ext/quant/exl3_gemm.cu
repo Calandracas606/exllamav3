@@ -6,6 +6,7 @@
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 #include "../util.h"
+#include "exl3_launch.h"
 #include "../util.cuh"
 #include "exl3_gemm_kernel.cuh"
 #include "exl3_kernel_map.cuh"
@@ -293,10 +294,10 @@ int exl3_gemm_gr
         kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }
-    cudaLaunchCooperativeKernel
+    exl3_launch_grid_sync_kernel
     (
         (void*) kernel,
-        num_sms,
+        dim3(num_sms, 1, 1),
         block_dim,
         kernelArgs,
         SMEM_MAX,
@@ -651,7 +652,7 @@ int exl3_mgemm_gr
         kernel_attr_set[device].insert((void*) kernel);
     }
 
-    cudaLaunchCooperativeKernel
+    exl3_launch_grid_sync_kernel
     (
         (void*) kernel,
         block_grid,
