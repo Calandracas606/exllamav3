@@ -1,5 +1,24 @@
 #pragma once
 
+#if defined(__HIPCC__)
+// rocWMMA under torch's __HIP_NO_HALF_{CONVERSIONS,OPERATORS}__ flags:
+// - the __half vector registrations static_cast float->__half (deleted ctor) -> break
+// - HIP_NO_HALF skips them, but this SDK build still references hfloat16_t in
+//   wmma_impl's gfx11 derivative regardless of the enable gate -> also breaks
+// Bridge: staged includes so the alias exists (float16_t is bit-identical to
+// __half) before the rest of rocwmma parses. Must run BEFORE any torch/ATen
+// header (the float8 trait glue also breaks after the torch chain).
+#ifndef EXL3_ROCWMMA_BRIDGE
+#define EXL3_ROCWMMA_BRIDGE
+#define HIP_NO_HALF 1
+#include <rocwmma/internal/config.hpp>
+#include <rocwmma/internal/types.hpp>
+namespace rocwmma { using hfloat16_t = float16_t; }
+#include <rocwmma/rocwmma.hpp>
+#undef HIP_NO_HALF
+#endif
+#endif
+
 #include <ATen/Tensor.h>
 #include "../graph.cuh"
 
