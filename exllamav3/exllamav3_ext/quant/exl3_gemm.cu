@@ -7,6 +7,172 @@
 namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
+#if defined(USE_ROCM)
+#define EXL3_ROCM_GEMV_M1 1
+#include <torch/extension.h>  // at::empty for the M=1 wrapper below
+#include <map>
+#include <tuple>
+#endif
+#include "exl3_gemm_kernel.cuh"
+#include "exl3_kernel_map.cuh"
+#include "exl3_devctx.cuh"
+#include "exl3_gemv.cuh"
+#if defined(USE_ROCM) && defined(EXL3_ROCM_GEMV_M1)
+namespace exl3_rocm_gemv
+{
+// tensor-level gr wrapper: had_in + GEMV + in-place fp32 had_out + cast copy, persistent
+// scratch (a lambda-installer could be dead-stripped; a defaulted fn ptr cannot)
+int m1_gr_default
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const c10::optional<at::Tensor>& suh,
+    const c10::optional<at::Tensor>& A_had,
+    const c10::optional<at::Tensor>& svh
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    const int64_t K = A.size(-1);
+    const int64_t N = C.size(-1);
+
+    // per-(device,K,N) scratch: every linear gets its own STABLE buffer, so kernels
+    // recorded into a whole-step graph keep valid pointers (a single shared pair would
+    // be reallocated by each new shape and leave the graph with dangling references)
+    // split-K partials mode: wide shapes row-store (splits x N) partials and the
+    // output epilogue sums them (no memset, no atomics); yf is sized accordingly
+    const int row_stride = m1_row_stride((int)(B.size(2) / 16), (int)(N / 16), (int)(K / 16));
+    const int splits_used = row_stride ? 4 : 1;
+
+    static std::map<std::tuple<int, int64_t, int64_t>, std::pair<at::Tensor, at::Tensor>> scratch;
+    auto key = std::make_tuple(A.device().index(), K, N);
+    auto it = scratch.find(key);
+    if (it == scratch.end())
+    {
+        auto xh_t = at::empty({1, K}, A.options());
+        auto yf_t = at::empty({row_stride ? (int64_t) row_stride * splits_used : N},
+                              A.options().dtype(at::kFloat));
+        it = scratch.emplace(key, std::make_pair(std::move(xh_t), std::move(yf_t))).first;
+    }
+    at::Tensor xh = it->second.first, yf = it->second.second;
+
+    cudaStream_t m1_stream = at::cuda::getCurrentCUDAStream().stream();
+    had_r_128(A.view({1, K}), xh.view({1, K}), suh, {}, 1.0f);
+
+    // fork switch: EXL3_WMMA_GEMV=0 restores the legacy gemv_vN<2> path
+    // (read here in C++ - the bench-side env vars have no reader otherwise)
+    static int wmma_default = -1;
+    if (wmma_default < 0) wmma_default = getenv("EXL3_WMMA_GEMV") ? 0 : 1;
+
+    bool wmma_done = false;
+    if (wmma_default && row_stride == 0)
+    {
+        // WMMA route, both split-K modes: row-store on the wide class lands in
+        // yf (sized splits x N by the shared policy) and the fused epilogue
+        // sums the partials; atomic mode memsets + accumulates into plain yf
+        wmma_done = gemm_wmma_launch(m1_stream,
+                                     reinterpret_cast<const uint16_t*>(B.data_ptr()),
+                                     reinterpret_cast<const __half*>(xh.data_ptr()),
+                                     reinterpret_cast<float*>(yf.data_ptr()),
+                                     (int)(B.size(2) / 16), (int)(N / 16), (int)(K / 16), 1);
+    }
+    if (!wmma_done)
+    {
+        launch(m1_stream,
+               reinterpret_cast<const uint16_t*>(B.data_ptr()), reinterpret_cast<const __half*>(xh.data_ptr()),
+               reinterpret_cast<float*>(yf.data_ptr()), (int)(B.size(2) / 16), (int)(N / 16), (int)(K / 16));
+    }
+    // fused output hadamard + RN cast (was: fp32 had kernel + copy_; identical bits);
+    // only for the canonical decode shape: half C, svh present, N % 128 == 0
+    if (svh && C.dtype() == at::kHalf && C.is_contiguous() && (N % 128) == 0)
+    {
+        m1_had_out_f32_to_h16<<<dim3(1, N / 128), 32, 0, m1_stream>>>
+        (
+            reinterpret_cast<const float*>(yf.data_ptr()),
+            reinterpret_cast<half*>(C.data_ptr()),
+            reinterpret_cast<const half*>(svh->data_ptr()),
+            0.088388347648f,
+            row_stride,
+            splits_used
+        );
+    }
+    else
+    {
+        had_r_128(yf.view({1, N}), yf.view({1, N}), {}, svh, 1.0f);
+        C.view({1, N}).copy_(yf.view({1, N}));
+    }
+    return 0;
+}
+
+
+int m1_entry(const at::Tensor& B, const at::Tensor& x, at::Tensor& y)
+{
+    const int bits = (int)(B.size(2) / 16);
+    const int n_subs = (int)(B.size(1));
+    const int k_tiles = (int)(B.size(0));
+    TORCH_CHECK(bits == 3 || bits == 4 || bits == 6, "m1_entry: unsupported bits");
+    cudaStream_t st = at::cuda::getCurrentCUDAStream().stream();
+    const int row_stride = m1_row_stride(bits, n_subs, k_tiles);
+    const int mm = x.dim() == 1 ? 1 : (int)x.size(0);
+    static int wmma_bench = -1;
+    if (wmma_bench < 0) wmma_bench = getenv("EXL3_WMMA_GEMV") ? 0 : 1;
+    if ((bits == 4 || bits == 3 || bits == 6) && wmma_bench &&
+        exl3_rocm_gemv::gemm_wmma_launch(st, reinterpret_cast<const uint16_t*>(B.data_ptr()),
+                         reinterpret_cast<const __half*>(x.data_ptr()),
+                         reinterpret_cast<float*>(y.data_ptr()), bits, n_subs, k_tiles, mm))
+        return 0;
+    if (row_stride == 0)
+    {
+        launch(st, reinterpret_cast<const uint16_t*>(B.data_ptr()), reinterpret_cast<const __half*>(x.data_ptr()),
+               reinterpret_cast<float*>(y.data_ptr()), bits, n_subs, k_tiles);
+        return 0;
+    }
+    // row-store mode: partials scratch + reduce (bench path only; production fuses
+    // the sum into the output epilogue)
+    static std::map<std::tuple<int, int, int>, at::Tensor> part;
+    auto key = std::make_tuple(bits, n_subs, k_tiles);
+    auto it = part.find(key);
+    if (it == part.end())
+        it = part.emplace(key, at::empty({4LL * n_subs * 16},
+                                         y.options().dtype(at::kFloat))).first;
+    if (bits != 4 || !wmma_bench)
+        launch(st, reinterpret_cast<const uint16_t*>(B.data_ptr()), reinterpret_cast<const __half*>(x.data_ptr()),
+               reinterpret_cast<float*>(it->second.data_ptr()), bits, n_subs, k_tiles);
+    const int64_t n4 = ((int64_t) n_subs * 16) / 4;   // float4 units (N % 128 == 0)
+    m1_reduce_rows<<<(unsigned)((n4 + 63) / 64), 64, 0, st>>>
+    (
+        reinterpret_cast<const float*>(it->second.data_ptr()), reinterpret_cast<float*>(y.data_ptr()),
+        n4, row_stride, 4
+    );
+    return 0;
+}
+}
+
+// python-visible raw bench entry (bandwidth verification)
+void exl3_gemv_bench
+(
+    const at::Tensor& trellis,
+    const at::Tensor& x,
+    at::Tensor& y
+)
+{
+    TORCH_CHECK(trellis.dtype() == at::kShort, "trellis must be int16");
+    TORCH_CHECK(x.dtype() == at::kHalf, "x must be half");
+    TORCH_CHECK(y.dtype() == at::kFloat, "y must be float32");
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && trellis.is_contiguous(),
+                "all tensors must be contiguous");
+    exl3_rocm_gemv::m1_entry(trellis, x, y);
+}
+#endif
+
+#if !defined(USE_ROCM)
+// CUDA stub: the plain-HIP M=1 GEMV is ROCm-only; keep the binding linkable
+void exl3_gemv_bench(const at::Tensor&, const at::Tensor&, at::Tensor&)
+{
+    TORCH_CHECK(false, "exl3_gemv_bench is ROCm-only");
+}
+#endif
+
 #include "exl3_gemm_kernel.cuh"
 #include "exl3_kernel_map.cuh"
 #include "exl3_devctx.cuh"
@@ -169,6 +335,12 @@ int exl3_gemm_gr
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
 
+    // M=1 plain-HIP GEMV fast path (ROCm): decode-dominant shapes; declines
+    // (returns 0) unless eligible, falling through to the dispatch below
+#if defined(USE_ROCM) && defined(EXL3_ROCM_GEMV_M1)
+    if (exl3_rocm_gemv::try_m1(A, B, C, suh, A_had, svh, size_m, size_k, size_n, mul1, mcg, graph != nullptr))
+        return 0;
+#endif
     // Select kernel
     TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
     int cb = 0;
