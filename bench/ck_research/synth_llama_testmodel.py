@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Synthesize a tiny 1-layer Llama EXL3 model for tests/test_qgemm.py."""
 import sys, os, json, torch
-sys.path.insert(0, "/tmp/conversation-worktrees/24b04d07-f055-440e-8f42-cb4f9d94c353/exllamav3")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from exllamav3.modules.quant.exl3_lib.quantize import quantize_exl3
 
 torch.set_grad_enabled(False)

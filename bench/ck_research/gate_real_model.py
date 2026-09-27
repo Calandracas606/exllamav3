@@ -4,7 +4,7 @@ linear.forward(ck) through the BC path — the same tolerance test_qgemm applies
 import os, sys
 import torch
 
-sys.path.insert(0, "/tmp/conversation-worktrees/24b04d07-f055-440e-8f42-cb4f9d94c353/exllamav3")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from exllamav3 import Config, Model
 torch.set_grad_enabled(False)
 
@@ -30,9 +30,7 @@ for bs in (1, 2, 33):
         lin.load(device = "cuda:0")
         torch.manual_seed(0)
         x = torch.randn((1, bs, lin.in_features), dtype = torch.half, device = "cuda:0")
-        os.environ["EXL3_CK_GEMV"] = "0"
         ref = lin.forward(x, {"reconstruct": True}).float()
-        os.environ["EXL3_CK_GEMV"] = "1"
         ck = lin.forward(x, {"reconstruct": False}).float()
         # P38 gate hole fix: the M=1 wrapper falls through to the GEMM on a
         # shape's FIRST eager call (autotune warmup), so a single call would
