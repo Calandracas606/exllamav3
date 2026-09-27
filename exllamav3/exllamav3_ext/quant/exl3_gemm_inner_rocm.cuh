@@ -181,13 +181,9 @@ struct wmma_decoder<4>
 
     __device__ static void init_lut(uint32_t*) {}   // no auxiliary state
 
-    // post-mma affine correction: the fragment holds the RAW window bits as
-    // f16 VALUES (h = 1024 + sum-of-nibbles), so the true weight
-    // w = k_inv * h + k_bias is recovered linearly OUTSIDE the k-loop:
-    // y_true = k_inv * acc + k_bias * sum(x). This deletes the udot4+fma
-    // decode from the hot loop entirely.
-    __device__ static float post_scale() { return __half2float(__ushort_as_half(0x1eee)); }
-    __device__ static float post_bias()  { return __half2float(__ushort_as_half(0xc931)); }
+    // the fragment holds the RAW window bits as f16 VALUES (h = 1024 +
+    // sum-of-nibbles); dec_half's hfma already applies the affine
+    // (h * k_inv + k_bias) per element at decode time
 
     // lane-selective raw-window emission: only the xset this lane's fragment
     // rows need (xset 0..3 -> funnel-shift pairs (28,24) (20,16) (12,8) (4,0)).
@@ -553,7 +549,6 @@ __device__ __forceinline__ void phase1_dq(SegCtx& c)
             fragment<matrix_a, 16, 16, 16, InputT, row_major> aFrag;
             fragment<matrix_b, 16, 16, 16, InputT, col_major> bFrag[WMAX];
             MmaFragAcc acc[WMAX];
-            float xacc = 0.f;   // this lane's 8 k-halves of row `arow` (b4 affine)
             #pragma unroll
             for (int b = 0; b < wt; ++b) fill_fragment(acc[b], 0.0f);
 
@@ -603,15 +598,6 @@ __device__ __forceinline__ void phase1_dq(SegCtx& c)
                         mma_sync(acc[b], aFrags[kk], bFrag[b], acc[b]);
                     }
                 }
-                #pragma unroll
-                for (int kk = 0; kk < KSTEP; ++kk)
-                if (arow < c.size_m)
-                {
-                    const uint32_t* fak = static_cast<const uint32_t*>(static_cast<const void*>(&aFrags[kk].x));
-                    const float2 f01 = __half22float2(*reinterpret_cast<const half2*>(&fak[0]));
-                    const float2 f23 = __half22float2(*reinterpret_cast<const half2*>(&fak[2]));
-                    xacc += f01.x + f01.y + f23.x + f23.y;
-                }
             }
             for (; t < c.kt1; ++t)
             {
@@ -637,23 +623,7 @@ __device__ __forceinline__ void phase1_dq(SegCtx& c)
                     fb[0] = fbv[0]; fb[1] = fbv[1]; fb[2] = fbv[2]; fb[3] = fbv[3];
                     mma_sync(acc[b], aFrag, bFrag[b], acc[b]);
                 }
-                if (arow < c.size_m)
-                {
-                    const float2 f01 = __half22float2(*reinterpret_cast<const half2*>(&fa[0]));
-                    const float2 f23 = __half22float2(*reinterpret_cast<const half2*>(&fa[2]));
-                    xacc += f01.x + f01.y + f23.x + f23.y;
-                }
             }
-
-            // b4 affine needs the full row sum: partner lane (k-half 0/1) holds
-            // the other 8 halves of the same row
-            if (bits == 4) xacc += __shfl_xor_sync(0xffffffffu, xacc, 16);
-
-            // NOTE: no b4 affine here. k_inv and k_bias pass linearly through
-            // the output Hadamard (the per-row bias lands on the H-delta column),
-            // matching the standalone-validated form: store the raw accumulator
-            // and let the cascade/epilogue own the transform.
-            float k_inv = 1.0f, k_bias = 0.0f;
 
             #pragma unroll
             for (int b = 0; b < WMAX; ++b)
@@ -669,9 +639,7 @@ __device__ __forceinline__ void phase1_dq(SegCtx& c)
                 {
                     const int m = 2 * i + m0;
                     if (m >= c.size_m) break;
-                    float v = fr[i];
-                    if (bits == 4) v = k_inv * v + k_bias * xacc;
-                    c.sh_c[(size_t) m * (c.subs_tile * 16) + (size_t) s * 16 + ncol] = v;
+                    c.sh_c[(size_t) m * (c.subs_tile * 16) + (size_t) s * 16 + ncol] = fr[i];
                 }
             }
         }
@@ -923,23 +891,3 @@ __device__ void exl3_gemm_kernel_inner
     }
 }
 
-// M=1 fused dequant-GEMV kernels (plain HIP: single-rounding hfma decode, uint4
-// strip loads, split-K atomics, and the b6 lane-layout algebra — no LUT, no
-// dependencies). Compiled only in TUs that define EXL3_ROCM_GEMV_M1
-// before including this header (currently exl3_gemm.cu) so the comp-unit TUs
-// don't instantiate them.
-// ============================================================================
-#if defined(EXL3_ROCM_GEMV_M1)
-
-#include <ATen/cuda/CUDAContext.h>
-#include <set>
-#include <tuple>
-#include <c10/cuda/CUDAGuard.h>
-#include "hadamard.cuh"
-
-#include "hadamard_inner.cuh"
-#include <cooperative_groups.h>
-namespace cg = cooperative_groups;
-
-
-#endif  // EXL3_ROCM_GEMV_M1
