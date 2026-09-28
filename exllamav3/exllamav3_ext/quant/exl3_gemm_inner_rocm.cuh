@@ -370,6 +370,7 @@ struct SegCtx
     int nsub_total;                 // subtiles per k row of the whole matrix (size_n / 16)
     int subs_tile;                  // subtiles in this column tile (TILESIZE_N / 16)
     int col;                        // column tile index
+    bool b6_wmma_m1;                // EXL3_B6_WMMA_M1=1: m=1 also rides the WMMA tier
 };
 
 // Tier A: bits 4, cb 2. 32 words per subtile, 8 lanes per (subtile, m row) item
@@ -509,6 +510,14 @@ __device__ __forceinline__ void phase1_b6c2(SegCtx& c)
     }
 }
 
+// m=1 entry over the same scalar body (phase1_b6c2 with size_m fixed at 1);
+// the GEMV-shaped decode case keeps the DRAM-saturated scalar strip loads
+// while m >= 2 routes to the WMMA tier in phase1_dq
+__device__ __forceinline__ void phase1_b6c2_gemv(SegCtx& c)
+{
+    phase1_b6c2(c);   // items = subs_tile * size_m degenerates to 1 pass at m=1
+}
+
 template <int bits, int cb>
 __device__ __forceinline__ void phase1_dq(SegCtx& c)
 {
@@ -518,6 +527,19 @@ __device__ __forceinline__ void phase1_dq(SegCtx& c)
         // b4 fragment holds raw windows; the affine correction is applied at
         // the store, linearly outside the k-loop). Same SegCtx contract, same
         // callers, same lock-cascade/epilogue as the scalar path below.
+        if (c.size_m == 1 && bits == 6 && !c.b6_wmma_m1)
+        {
+            // b6 GEMV shape: the scalar tier is DRAM-saturated here (measured
+            // 747-758 GB/s on the 67 MB streams; the best correct WMMA form
+            // reaches 466 — the WMMA fragment layout keeps ~256B of trellis
+            // in flight per warp vs the scalar 8-lane groups' ~768B, and a
+            // single row has no arithmetic to amortize that with; whole-model
+            // decode measured 23.96 vs 13.35 tok/s all-WMMA). EXL3_B6_WMMA_M1=1
+            // opts into the literal all-m-on-WMMA dispatch, accepting the
+            // measured regression.
+            phase1_b6c2_gemv(c);
+            return;
+        }
         using namespace exl3_rocm_gemv;
         using Dec = wmma_decoder<bits>;
         constexpr int W = Dec::words_per_row;
@@ -541,7 +563,9 @@ __device__ __forceinline__ void phase1_dq(SegCtx& c)
         // P46: runtime warp tile from the instance's actual width: 2 subtiles
         // per warp when the tile has >= 2 subtiles per warp (SHAPE_5's 16
         // subtiles / 8 warps), else 1. phase1_dq is not a template on the
-        // tile sizes, so the width arrives via SegCtx (subs_tile).
+        // tile sizes, so the width arrives via SegCtx (subs_tile). (wt=2
+        // measured slower for b6: the doubled decode issue outweighs the
+        // extra bytes in flight.)
         const int wt = 1;
         constexpr int WMAX = 2;
         for (int idx0 = warp * wt; idx0 < c.subs_tile; idx0 += warps * wt)
@@ -738,6 +762,11 @@ __device__ void exl3_gemm_kernel_inner
 
     if (size_n_stride == 0) size_n_stride = size_n;
     const int n_full = size_n_stride;    // B rows and C rows span the full matrix width
+    // EXL3_B6_WMMA_M1=1 arrives as bit 0 of the locks pointer (the host ORs it
+    // in; per-TU device globals don't work without GPU RDC). Mask before any
+    // lock use.
+    const bool b6_wmma_m1 = ((uintptr_t) locks & (uintptr_t) 1) != 0;
+    locks = (int*) ((uintptr_t) locks & ~(uintptr_t) 1);
     constexpr int TS_N = TILESIZE_N;
     float* sh_c = sh;
 
@@ -756,6 +785,7 @@ __device__ void exl3_gemm_kernel_inner
     c.size_k = size_k;
     c.nsub_total = n_full / 16;
     c.subs_tile = TS_N / 16;
+    c.b6_wmma_m1 = b6_wmma_m1;
 
     while (beg < end)
     {
@@ -772,10 +802,9 @@ __device__ void exl3_gemm_kernel_inner
         {
             phase1_b4c2(c);
         }
-        else if constexpr (cb == 2 && bits == 6)
-        {
-            phase1_b6c2(c);
-        }
+        // cb==2 bits==6: the WMMA tensor-core tier in phase1_dq (M-agnostic,
+        // weights decoded once per 16-row tile; the scalar phase1_b6c2
+        // re-streamed the trellis per output row)
         else if constexpr (bits > 0)
         {
             phase1_dq<bits, cb>(c);
