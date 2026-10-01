@@ -17,7 +17,10 @@
     // multi-device footprints, EXL3_COOP_LAUNCH=0 opts out). group_barrier matches grid.sync()
     // semantics for the uniform, stream-serialized grids used here; co-residency is guaranteed by
     // the cooperative launch, or by the plain launch clamping gridDim.z to 1.
-    #define EXL3_GRID_BARRIER() group_barrier(0, gridDim.x * gridDim.z, locks + BARRIER_LOCKS_OFFSET)
+    // (the WMMA b6 m=1 flag piggybacks on bit 0 of the locks pointer; strip it before the
+    // barrier's atomics, otherwise EXL3_B6_WMMA_M1 + EXL3_COOP_LAUNCH=0 deadlock on misaligned
+    // lock atomics)
+    #define EXL3_GRID_BARRIER() group_barrier(0, gridDim.x * gridDim.z, (int*) ((uintptr_t) locks & ~(uintptr_t) 1) + BARRIER_LOCKS_OFFSET)
 #else
     #define EXL3_GRID_BARRIER() grid.sync()
 #endif
