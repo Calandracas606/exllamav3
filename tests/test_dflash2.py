@@ -275,7 +275,14 @@ def test_topk_cuda_matches_torch():
             ref_v, ref_i = torch.topk(ref, k, dim = -1)
             for b in range(2):
                 for r in range(7):
-                    assert sorted(indices[b, r].tolist()) == sorted(ref_i[b, r].tolist()), (k, dtype, b, r)
+                    got, exp = set(indices[b, r].tolist()), set(ref_i[b, r].tolist())
+                    if got != exp:
+                        # fp16 inputs collide to bit-identical transformed values under the
+                        # softcap, and ROCm's torch.topk breaks the boundary tie differently
+                        # than the kernel (lowest id); only value-equal swaps are allowed
+                        row = ref[b, r]
+                        assert got - exp and exp - got
+                        assert all(row[i] == row[j] for i in got - exp for j in exp - got), (k, dtype, b, r)
                     got = values[b, r][indices[b, r].argsort()]
                     exp = ref_v[b, r][ref_i[b, r].argsort()]
                     torch.testing.assert_close(got, exp, rtol = 1e-5, atol = 1e-5)
