@@ -95,7 +95,16 @@ int exl3_gemm_blockdim[] = {EXL3_GEMM_BLOCKDIM};
 // and the MoE kernel (which passes false).
 int exl3_gemm_shape_smem(int shape_idx, int K, bool half_k)
 {
+#if defined(USE_ROCM)
+    // On HIP the kernel does not stage A/B tiles in dynamic smem (static inner_sh instead),
+    // so exl3_gemm_smem_bytes()'s cost is the CUDA layout's, not this build's. The dynamic
+    // footprint is the MoE kernel's hadamard scratch, bounded by the 8 KB seam request
+    // (DevCtx::get_smem_request), which every shape must keep fitting under.
+    (void) shape_idx; (void) K; (void) half_k;
+    return 8 * 1024;
+#else
     return exl3_gemm_smem_bytes_for_shape(shape_idx, K, half_k, true);
+#endif
 }
 
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int K, bool half_k)

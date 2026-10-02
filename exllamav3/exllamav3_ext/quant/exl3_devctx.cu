@@ -63,7 +63,18 @@ int DevCtx::get_smem_max(int device)
 
 int DevCtx::get_smem_request(int device)
 {
+#if defined(USE_ROCM)
+    // The ROCm inners stage their tiles in static __shared__ (inner_sh) rather than dynamic
+    // smem; the only dynamic consumer is the MoE kernel's hadamard scratch (had_hf_r_128_d_inner,
+    // 512 B per warp). gfx1100 gives a block 64 KB of LDS total, which must also cover that
+    // static allocation, so the driver's 64 KB opt-in value can never be granted here. The
+    // historical seam request (see exl3_gemm_inner_rocm.cuh and exl3_moe.cu) is what a launch
+    // may ask for.
+    (void) device;
+    return 8 * 1024;
+#else
     return MIN(get_smem_max(device), EXL3_SMEM_MAX_DEFAULT);
+#endif
 }
 
 void* DevCtx::get_ws(int device)
