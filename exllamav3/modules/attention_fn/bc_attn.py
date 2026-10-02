@@ -65,6 +65,14 @@ def _is_pow2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 
+def _get_sm_count(device: torch.device | int) -> int:
+    # TP shards store their device as a plain index
+    idx = device.index if hasattr(device, "index") else device
+    if idx not in _sm_count:
+        _sm_count[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return _sm_count[idx]
+
+
 class BCKernelTooLarge(RuntimeError):
     """An AOT-compiled BC kernel needs more shared memory than the device grants. The BC kernels
     bake their tiles in as constexprs sized for Ampere-class shared memory; the eager Triton path

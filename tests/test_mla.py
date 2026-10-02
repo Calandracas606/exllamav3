@@ -39,7 +39,7 @@ class FakeSTC:
 
     def get_tensor(self, key, device = None, optional = False, allow_bf16 = False,
                    float2half = False, no_defer = False, transpose = False, pad_to = None,
-                   fidx = None):
+                   fidx = None, arena = False):
         if key not in self.tensors:
             if optional:
                 return None
