@@ -59,6 +59,12 @@ class InferParams:
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
+        # The HIP exl3_mgemm kernel is broken: it flattens the per-matrix pointer arrays into
+        # one matrix, scrambling the output staging buffers and writing out of bounds. Keep
+        # all callers on the separate-projection path until the kernel is fixed.
+        import torch
+        if torch.version.hip:
+            return False
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
         # requires the mul1 codebook; other tensors always keep the fused MGEMM
         if not mul1:
@@ -69,7 +75,6 @@ class InferParams:
         # EXL3_MGEMM_K_THRESHOLD pins it explicitly
         K_thr = self.mgemm_K_threshold
         if K_thr and not self.mgemm_K_env and device is not None:
-            import torch
             device = torch.device(device)
             if device.type == "cuda" and device.index is not None:
                 from ..ext import exllamav3_ext as ext

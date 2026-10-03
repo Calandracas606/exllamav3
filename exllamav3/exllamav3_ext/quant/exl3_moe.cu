@@ -9,6 +9,12 @@ namespace cg = cooperative_groups;
 #include "../util.cuh"
 #include "comp_units/exl3_moe_instances.cuh"
 #include "bits_k.cuh"
+// 8 KB matches exl3_gemm_inner_rocm.cuh's SMEM_MAX (exl3_moe_common.cuh's 90 KB
+// fallback would exceed gfx1100's LDS)
+#if defined(USE_ROCM)
+#undef SMEM_MAX
+#define SMEM_MAX (8 * 1024)
+#endif
 #include "exl3_devctx.cuh"
 #include <set>
 
@@ -305,7 +311,7 @@ void exl3_moe
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
         moe_kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }

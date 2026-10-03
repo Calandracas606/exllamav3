@@ -451,7 +451,13 @@ void dflash2_topk_kernel
     __threadfence();
     if (t == 0)
     {
+#if defined(USE_ROCM)
+        // gfx1100: a relaxed atomicAdd here can become visible before the partial stores
+        // ahead of the fence; the acquire-release RMW orders them
+        int arrived = __hip_atomic_fetch_add(&counters[row_id], 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+#else
         int arrived = atomicAdd(&counters[row_id], 1);
+#endif
         s_last = arrived == splits - 1;
     }
     __syncthreads();

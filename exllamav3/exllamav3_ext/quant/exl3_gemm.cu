@@ -199,6 +199,15 @@ int exl3_gemm_gr
     int shape_idx;
     fp_exl3_gemm_kernel kernel;
 
+    // EXL3_B6_WMMA_M1=1: route the GEMV-shaped b6 m=1 through the WMMA tier
+    // too (literal all-m-on-WMMA dispatch). Off by default — the scalar m=1
+    // strip is 1.4-1.6x faster there (see the branch comment in the inner).
+    // The flag travels as bit 0 of the locks pointer (device globals are
+    // per-TU without GPU RDC). One-shot static env read (the value must be
+    // stable before CUDA graph warmup).
+    static const int b6_wmma_m1 = getenv("EXL3_B6_WMMA_M1") ? atoi(getenv("EXL3_B6_WMMA_M1")) : 0;
+    if (b6_wmma_m1) locks = (int*) ((uintptr_t) locks | (uintptr_t) 1);
+
     void* kernelArgs[] =
     {
         (void*)& A_ptr,
@@ -248,7 +257,14 @@ int exl3_gemm_gr
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
+#if defined(USE_ROCM)
+        // The ROCm inner's b6 tier switches kernels at m == 1 (scalar GEMV
+        // strip) vs m >= 2 (WMMA), so m=1 must not share a tuning entry with
+        // m=2..16 the way the CUDA key folds it
+        uint64_t autotune_key = gemm_autotune_hash(size_m, size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
+#else
         uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
+#endif
         CoopAutotuneLaunch tuned;
         if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, smem_max, stream, &tuned))
         {
@@ -264,6 +280,23 @@ int exl3_gemm_gr
             fp_exl3_gemm_kernel candidate_kernel = get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
             if (!candidate_kernel) continue;
 
+            // The L2-thrashed cold-clock bench mis-ranks the b6 tier (measured
+            // at production clocks: m=1 wants the 512-wide tiles (S4, 750+ GB/s
+            // vs S3 421) and m 2..16 the WMMA tier's 256-wide tiles (S3, 15-40%
+            // over S1/S2/S4 on every b6 shape); the tuner's thrash-first
+            // protocol inverts both). EXL3_GEMM_B6_SHAPE=0 restores the tuner.
+            // Under EXL3_B6_WMMA_M1=1 the m=1 case also runs WMMA, so it takes
+            // the m>=2 bias.
+#if defined(USE_ROCM)
+            if (K == 6 && cb == 2 && size_n % 256 == 0
+                && getenv("EXL3_GEMM_B6_SHAPE") == nullptr)
+            {
+                const bool m1_scalar = (size_m == 1) && !b6_wmma_m1;
+                const int bias_shape = (m1_scalar && size_n % 512 == 0) ? 4 : 3;
+                if (candidate_shape_idx == bias_shape) candidates.clear();
+                else if (candidate_shape_idx > bias_shape) continue;
+            }
+#endif
             int tilesize_k = exl3_gemm_tilesize_k_g[candidate_shape_idx];
             int tilesize_n = exl3_gemm_tilesize_n_g[candidate_shape_idx];
             int max_slices = MAX(size_k / tilesize_k * size_n / tilesize_n, 1);
@@ -299,7 +332,7 @@ int exl3_gemm_gr
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
         kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }
@@ -662,7 +695,7 @@ int exl3_mgemm_gr
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
         kernel_attr_set[device].insert((void*) kernel);
     }
 

@@ -4,6 +4,13 @@ import pytest
 import torch
 from exllamav3.modules.block_sparse_mlp import BlockSparseMLP, MAX_BSZN
 
+# ROCm: the fused bszN tier declines on HIP (bszn_eligible checks torch.version.hip), so the
+# shared-expert-inside-fused-kernel path this test exercises never runs there
+pytestmark = pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="fused bszN kernel not built on ROCm",
+)
+
 
 @pytest.mark.parametrize('rows,pending', [(1, True), (1, False), (MAX_BSZN + 1, True)])
 @pytest.mark.parametrize('tp', [False, True])
@@ -80,9 +87,9 @@ def test_fused_shared_expert_is_not_run_twice():
         support_quant_paths=True, router_pre_norm=None, routed_pre_norm=None,
         latent_in=None, latent_out=None, routing_gate=object(), routing_cfg=None,
         routing_fn=lambda *args: (torch.zeros(1, 1, dtype=torch.long), torch.ones(1, 1)),
-        routing_device=None, cpu_split_first=0,
+        routing_device=None, cpu_split_first=0, fused_mode_buffers=None, fused_rows=0,
         cpu_split_submit=lambda *args: (None, object()), cpu_split_combine=collect,
-        cpu_offload=False, intermediate_size=4, num_local_experts=1, tp_reduce=False,
+        cpu_offload=False, intermediate_size=4, num_local_experts=1, num_experts=1, tp_reduce=False,
         shared_experts=SimpleNamespace(forward=unexpected), shared_experts_post_norm=None,
         routed_post_norm=None, shared_gate=None,
     )
