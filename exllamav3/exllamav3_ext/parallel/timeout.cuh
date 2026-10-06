@@ -16,8 +16,21 @@ __device__ __forceinline__ uint32_t check_timeout(PGContext* ctx, uint64_t deadl
     uint32_t timeout = globaltimer_ns() >= deadline ? 1 : 0;
     if (timeout && threadIdx.x == 0)
     {
+        // The kernel name is copied out for the host to print on HIP. No device printf here: kernels
+        // containing device-side printf fail to launch outright on HIP runtimes (observed as
+        // hipErrorIllegalState from every non-zero device's first collective launch), and even where
+        // the launch works, output from a wedged collective may never drain
+        #if defined(USE_ROCM)
+            char* dst = ctx->sync_timeout_name;
+            int i = 0;
+            #pragma unroll 8
+            for (; i < 63 && name[i]; ++i) dst[i] = name[i];
+            dst[i] = 0;
+            __threadfence_system();
+        #else
+            printf(" ## Synchronization timeout in kernel: %s\n\n", name);
+        #endif
         stg_release_sys_u32(&ctx->sync_timeout, 1);
-        printf(" ## Synchronization timeout in kernel: %s\n\n", name);
     }
     return timeout;
 }

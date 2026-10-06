@@ -10,6 +10,7 @@ void pg_init_context(uintptr_t ctx)
     PGContext* ctx_ptr = (PGContext*) ctx;
 
     ctx_ptr->sync_timeout = 0;
+    memset(ctx_ptr->sync_timeout_name, 0, sizeof(ctx_ptr->sync_timeout_name));
     ctx_ptr->barrier_epoch = 1;
     ctx_ptr->broadcast_ll_epoch = 1;
 
@@ -41,6 +42,14 @@ void pg_check_timeout(uintptr_t ctx)
     PGContext* ctx_ptr = (PGContext*) ctx;
     if (ctx_ptr->sync_timeout)
     {
-        TORCH_CHECK(false, "Synchronization timeout");
+        // The flag is released only after the name bytes are written (check_timeout), so a complete
+        // name is visible here. On CUDA the kernel already printed it
+        #if defined(USE_ROCM)
+            const char* name = ctx_ptr->sync_timeout_name;
+            TORCH_CHECK(false, "Synchronization timeout in kernel: ",
+                        name[0] ? name : "<unknown>");
+        #else
+            TORCH_CHECK(false, "Synchronization timeout");
+        #endif
     }
 }

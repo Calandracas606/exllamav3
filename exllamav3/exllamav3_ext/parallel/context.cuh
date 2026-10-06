@@ -37,6 +37,9 @@ struct ReduceJob
 struct alignas(64) PGContext
 {
     uint32_t sync_timeout;
+    // Name of the kernel that raised the sticky timeout, written by the kernel for the host to
+    // print (device printf cannot be used: see check_timeout in timeout.cuh)
+    char sync_timeout_name[64];
     uint32_t barrier_epoch;
     alignas(16) uint32_t barrier_epoch_device[MAX_DEVICES];
     alignas(16) uint32_t broadcast_stage_device[MAX_DEVICES];
