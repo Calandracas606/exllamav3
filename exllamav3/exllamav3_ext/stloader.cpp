@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "stloader.h"
 #include <iostream>
 #include <thread>
@@ -182,7 +183,8 @@ static void validate_jobs(std::vector<TensorLoadJob> const& jobs)
 // stream, record the slot event, move on. The next read overlaps the previous slots' copies.
 // Each worker drains its streams before reporting done, so batch completion implies all copies
 // have landed.
-static void pool_worker_main(int thread_idx)
+// single_shot: run one batch in the CALLER's thread (EXL3_STLOADER_INLINE)
+static void pool_worker_main(int thread_idx, bool single_shot = false)
 {
     cudaEvent_t events[STLOADER_SLOTS_PER_THREAD] = {};
     int event_device[STLOADER_SLOTS_PER_THREAD] = {};
@@ -198,7 +200,8 @@ static void pool_worker_main(int thread_idx)
         const std::vector<LoadRun>* runs;
         {
             std::unique_lock<std::mutex> lock(pool_mtx);
-            pool_cv_work.wait(lock, [&] { return pool_generation != seen_generation; });
+            if (!single_shot)
+                pool_cv_work.wait(lock, [&] { return pool_generation != seen_generation; });
             seen_generation = pool_generation;
             jobs = batch_jobs;
             runs = batch_runs;
@@ -322,6 +325,7 @@ static void pool_worker_main(int thread_idx)
             pool_workers_done++;
         }
         pool_cv_done.notify_all();
+        if (single_shot) return;
     }
 }
 
@@ -417,25 +421,43 @@ static std::string stloader_cuda_engine(std::vector<TensorLoadJob> const& jobs, 
         batch_err.clear();
     }
     batch_next_run.store(0, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lock(pool_mtx);
-        batch_jobs = &jobs;
-        batch_runs = &runs;
-        pool_workers_done = 0;
-        if (!pool_started)
-        {
-            for (int i = 0; i < STLOADER_THREADS; ++i)
-                std::thread(pool_worker_main, i).detach();
-            pool_started = true;
-        }
-        pool_generation++;
-    }
-    pool_cv_work.notify_all();
 
-    // Wait for all workers to finish and drain
+    // Fix a TP load hang on gfx1100 (ROCm, no PCIe atomics): pool threads can hang
+    // inside their first CUDA call. EXL3_STLOADER_INLINE=1 runs the batch in the
+    // caller's thread instead (already CUDA-active).
+    static const bool inline_pool = [] { const char* e = getenv("EXL3_STLOADER_INLINE"); return e && strcmp(e, "0") != 0; }();
+    if (inline_pool)
     {
-        std::unique_lock<std::mutex> lock(pool_mtx);
-        pool_cv_done.wait(lock, [] { return pool_workers_done == STLOADER_THREADS; });
+        {
+            std::lock_guard<std::mutex> lock(pool_mtx);
+            batch_jobs = &jobs;
+            batch_runs = &runs;
+            pool_workers_done = 0;
+        }
+        pool_worker_main(0, true);
+    }
+    else
+    {
+        {
+            std::lock_guard<std::mutex> lock(pool_mtx);
+            batch_jobs = &jobs;
+            batch_runs = &runs;
+            pool_workers_done = 0;
+            if (!pool_started)
+            {
+                for (int i = 0; i < STLOADER_THREADS; ++i)
+                    std::thread(pool_worker_main, i, false).detach();
+                pool_started = true;
+            }
+            pool_generation++;
+        }
+        pool_cv_work.notify_all();
+
+        // Wait for all workers to finish and drain
+        {
+            std::unique_lock<std::mutex> lock(pool_mtx);
+            pool_cv_done.wait(lock, [] { return pool_workers_done == STLOADER_THREADS; });
+        }
     }
 
     if (batch_failed.load(std::memory_order_acquire))
