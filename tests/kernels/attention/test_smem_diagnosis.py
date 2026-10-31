@@ -40,7 +40,7 @@ def test_exception_type_and_message_are_preserved():
 
 def test_notes_a_config_the_walk_measured_as_fitting():
     """The picked config was measured to fit, so probe and load disagree for it."""
-    smem._probe_log[("paged_attn_prefill", ("K",))] = [((128, 32, 8, 2), 65536)]
+    smem._probe_log[("paged_attn_prefill", ("K",))] = ([((128, 32, 8, 2), 65536)], {(128, 32, 8, 2): "nw=8 ns=2 probe"}, "nw=8 ns=2 launch")
     e = _err()
     assert smem._note_probe_miss(e, "paged_attn_prefill", ("K",), DEVICE, (128, 32, 8, 2))
     note = "\n".join(e.__notes__)
@@ -51,7 +51,7 @@ def test_notes_a_config_the_walk_measured_as_fitting():
 
 def test_notes_a_config_the_walk_never_probed():
     """The config was not among the walk's candidates, so the pick did not come from this walk."""
-    smem._probe_log[("paged_attn_prefill", ("K",))] = [((64, 32, 4, 2), 65536)]
+    smem._probe_log[("paged_attn_prefill", ("K",))] = ([((64, 32, 4, 2), 65536)], {(64, 32, 4, 2): "nw=4 ns=2 probe"}, "nw=4 ns=2 launch")
     e = _err()
     smem._note_probe_miss(e, "paged_attn_prefill", ("K",), DEVICE, (128, 32, 8, 2))
     note = "\n".join(e.__notes__)
@@ -78,7 +78,36 @@ def test_records_the_walk_when_a_config_is_picked(monkeypatch):
 
     picked = smem.pick_config(DEVICE, "test_note_walk", ("rec",), ["big", "small"], probe)
     assert picked == "small"
-    assert smem._get_probe_log("test_note_walk", ("rec",)) == [("big", limit * 2), ("small", limit // 2)]
+    walk, sigs, launch_sig = smem._get_probe_log("test_note_walk", ("rec",))
+    assert walk == [("big", limit * 2), ("small", limit // 2)]
+
+
+def test_notes_identical_probe_and_launch_arguments():
+    """Same config, same arguments: the note must say the two compiles should be the same kernel,
+    so the reader knows the disagreement is not an argument mismatch."""
+    sig = "nw=8 ns=2 1x64x8x64:float16|2x256x2x64:float16"
+    smem._probe_log[("paged_attn_prefill", ("K",))] = (
+        [((128, 32, 8, 2), 65536)], {(128, 32, 8, 2): sig}, sig)
+    e = _err()
+    smem._note_probe_miss(e, "paged_attn_prefill", ("K",), DEVICE, (128, 32, 8, 2))
+    note = "\n".join(e.__notes__)
+    assert "arguments are identical" in note
+    assert "DIFFER" not in note
+
+
+def test_notes_differing_probe_and_launch_arguments():
+    """Different arguments for one config means the probe measured a different kernel entirely;
+    the note must show both signatures so the difference is visible."""
+    smem._probe_log[("paged_attn_prefill", ("K",))] = (
+        [((128, 32, 8, 2), 65536)],
+        {(128, 32, 8, 2): "nw=8 ns=2 1x64x8x64:float16|partial:float16"},
+        "nw=8 ns=2 1x64x8x64:float16|partial:float32")
+    e = _err()
+    smem._note_probe_miss(e, "paged_attn_prefill", ("K",), DEVICE, (128, 32, 8, 2))
+    note = "\n".join(e.__notes__)
+    assert "DIFFER" in note
+    assert "partial:float16" in note
+    assert "partial:float32" in note
 
 
 def test_prefill_launch_notes_an_out_of_resources(monkeypatch):

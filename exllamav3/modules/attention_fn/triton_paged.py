@@ -9,7 +9,7 @@ import triton.language as tl
 from triton.runtime.errors import OutOfResources
 
 from .common import AttnArgs, get_non_causal_span_arglist
-from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder, _note_probe_miss
+from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder, _note_probe_miss, _record_launch, _probe_signature
 from ...util.backend import ROCM, gfx_arch, attn_decode_config
 
 
@@ -2129,8 +2129,11 @@ def paged_attn_triton_prefill(
         pick_key = (head_dim, hd_pad, qck, qcv, new_kv_mode, bool(causal), window_left >= 0,
                     window_right >= 0, has_sinks, stock)
         def probe(cfg):
+            # The signature travels with the footprint: pick_config keeps it so a launch that fails
+            # anyway can show whether it compiled the kernel this probe measured
             _, args, nw, ns, *_ = prepare(cfg)
-            return shared_bytes(_paged_attn_prefill_kernel, args, num_warps = nw, num_stages = ns)
+            return (shared_bytes(_paged_attn_prefill_kernel, args, num_warps = nw, num_stages = ns),
+                    _probe_signature(args, nw, ns))
         cfg = pick_config(q.device, "paged_attn_prefill", pick_key, candidates, probe)
 
         if staging_slices is not None:
@@ -2220,6 +2223,7 @@ def paged_attn_triton_prefill(
 
         def launch(ns):
             try:
+                _record_launch("paged_attn_prefill", pick_key, args, num_warps, ns)
                 _paged_attn_prefill_kernel[grid](*args, num_warps = num_warps, num_stages = ns)
             except OutOfResources as e:
                 # The walk approved this config on a measurement the loader contradicts. Attach that

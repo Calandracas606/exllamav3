@@ -34,21 +34,62 @@ class NoFittingConfig(RuntimeError):
     probe cost is paid once per launch key."""
 
 
-def _get_probe_log(name: str, key):
-    """The (candidate, footprint) pairs measured while choosing under this launch key, or None."""
-    return _probe_log.get((name, key))
+def _probe_signature(args, num_warps, num_stages) -> str:
+    """The arguments one launch-shaped call is made with, in the form the compiler and loader size
+    their structures from.
+
+    Tensor dtype and shape decide how the kernel specialises and how much it needs; the scalars are
+    passed through because the constexpr ones are part of the compile key. Recording this next to the
+    measured footprint is what makes a report from another machine comparable: if the probe and the
+    launch recorded different signatures for one config, they compiled different kernels and the
+    footprints are not comparable at all.
+    """
+    tensors = []
+    for a in args:
+        if isinstance(a, torch.Tensor):
+            tensors.append("x".join(str(s) for s in a.shape) + f":{str(a.dtype).replace('torch.', '')}")
+        else:
+            tensors.append(str(a))
+    return f"nw={num_warps} ns={num_stages} " + "|".join(tensors)
 
 
 NOTE_REASON = "smem-probe-miss"
 
 
-def _note_probe_miss(err: Exception, name: str, key, device, cfg) -> bool:
-    """Attach the walk that approved `cfg` to a launch-time OutOfResources, in place.
+def _get_probe_log(name: str, key):
+    """The walk recorded under this launch key: (probed pairs, probe signatures, launch signature)."""
+    return _probe_log.get((name, key))
 
-    The loader reports only what it wanted. The walk reports what it measured for each candidate,
-    and that is what tells a report from a device we do not have apart: either the walk measured
-    this config as fitting (the probe and the load disagree for it), or it never measured it (the
-    pick came from cache under a different key), or it measured something else entirely.
+
+def _record_walk(name: str, key, log, sigs) -> None:
+    """Keep the walk for a key, preserving any launch signature already recorded for it."""
+    prev = _probe_log.get((name, key))
+    launch_sig = prev[2] if prev else None
+    _probe_log[(name, key)] = (log, dict(sigs), launch_sig)
+
+
+def _record_launch(name: str, key, args, num_warps, num_stages) -> None:
+    """Record the arguments the launch is about to use, next to what the walk measured.
+
+    The walk measures a config; the launch then launches it with some argument list. prepare() is
+    written so those are the same list. When they are not -- a buffer of another dtype, a different
+    head count -- the walk measured a different kernel, which is exactly the case where a probe
+    reports a footprint the launch then exceeds.
+    """
+    sig = _probe_signature(args, num_warps, num_stages)
+    prev = _probe_log.get((name, key))
+    walk, sigs = (prev[0], prev[1]) if prev else (None, {})
+    _probe_log[(name, key)] = (walk, sigs, sig)
+
+
+def _note_probe_miss(err: Exception, name: str, key, device, cfg) -> bool:
+    """Attach the walk that approved `cfg`, and the arguments the launch used, to a launch-time
+    OutOfResources, in place.
+
+    The loader reports only what it wanted. The walk reports what it measured per candidate, and the
+    recorded signatures say whether the probe compiled the same kernel the launch did. Those three
+    separate the cases a report from hardware we do not have cannot otherwise distinguish: the walk
+    measured this config as fitting, or never measured it, or measured it with other arguments.
 
     Returns whether the note was attached; the exception is unchanged otherwise.
     """
@@ -56,23 +97,32 @@ def _note_probe_miss(err: Exception, name: str, key, device, cfg) -> bool:
     if add_note is None:
         return False
     limit = smem_limit(device)
-    log = _probe_log.get((name, key))
+    walk, sigs, launch_sig = _probe_log.get((name, key), (None, {}, None))
     lines = [f"[{NOTE_REASON}] {name}: config {cfg} on a device granting {limit} B"]
-    if not log:
+    if not walk:
         lines.append("  probe recorded nothing for this launch key: the config came from the pick "
                      "cache, or the key differs between the pick and this launch")
     else:
         lines.append("  probe measured:")
-        for cand, need in log:
+        for cand, need in walk:
             lines.append(f"    {cand}: {need} B")
-        if cfg not in [c for c, _ in log]:
-            lines.append(f"  {cfg} was never probed; the walk picked from {[c for c, _ in log]}")
-        elif all(need <= limit for _, need in log):
+        if cfg not in [c for c, _ in walk]:
+            lines.append(f"  {cfg} was never probed; the walk picked from {[c for c, _ in walk]}")
+        elif all(need <= limit for _, need in walk):
             lines.append("  every probed candidate measured as fitting, so for at least one of them "
                          "the compiled footprint and the footprint the loader accepts disagree")
         else:
-            picked = dict(log).get(cfg)
+            picked = dict(walk).get(cfg)
             lines.append(f"  {cfg} measured {picked} B, which fits {limit} B, yet the load failed")
+        probe_sig = sigs.get(cfg)
+        if probe_sig is not None and launch_sig is not None:
+            if probe_sig == launch_sig:
+                lines.append("  probe and launch arguments are identical, so the two compiles of "
+                             "this config should be the same kernel")
+            else:
+                lines.append("  probe and launch arguments DIFFER -- they compiled different kernels:")
+                lines.append(f"    probe:  {probe_sig}")
+                lines.append(f"    launch: {launch_sig}")
     add_note("\n".join(lines))
     return True
 
@@ -118,17 +168,22 @@ def pick_config(device, name: str, key, candidates, probe):
         return cfg
     need = None
     log = []
+    sigs = {}
     for cand in candidates:
-        need = probe(cand)
+        measured = probe(cand)
+        # A probe may return (footprint, signature); the signature is what the compile keys on
+        need, sig = measured if isinstance(measured, tuple) else (measured, None)
         log.append((cand, need))
+        if sig is not None:
+            sigs[cand] = sig
         if _debug:
             print(f" -- smem: {name} {key} config {cand}: {need} B ({'fits' if need <= limit else 'over'} {limit} B)", flush = True)
         if need <= limit:
             _picks[full_key] = cand
-            _probe_log[(name, key)] = log
+            _record_walk(name, key, log, sigs)
             return cand
     _picks[full_key] = None
-    _probe_log[(name, key)] = log
+    _record_walk(name, key, log, sigs)
     raise NoFittingConfig(
         f"{name}: no tile configuration fits the device's {limit} B of dynamic shared memory "
         f"(the smallest candidate needs {need} B)"
