@@ -87,20 +87,27 @@ def pick_config(device, name: str, key, candidates, probe):
 
 
 def shared_bytes(kernel, args, **kwargs) -> int:
-    """Footprint of the load this argument tuple performs, in bytes.
+    """Compile-only footprint of a JIT kernel with the launch's real arguments.
 
-    A compile-only warmup is not a safe oracle. The budget check that actually fails lives in
-    CompiledKernel._init_handles(), which a warmup never calls, so a build that reports a smaller
-    footprint at warmup than at load lets an oversized tile through the ladder. Compile with a
-    warmup, then run that same load check directly: it raises OutOfResources on an oversized tile
-    and otherwise leaves the module loaded and ready, so the real launch reuses it. The kernel
-    body is never executed -- probing must not run attention over placeholder arguments."""
-    compiled = kernel.run(*args, grid = (1,), warmup = True, **kwargs)
+    This is a hint, not a verdict. On some Triton builds the metadata reported here disagrees with
+    what the same specialization requires when the launch loads it, so a ladder that trusts this
+    number can accept a tile the launch then refuses. Callers must treat the value as a fast first
+    filter and keep launch_compatible() as the authority."""
+    return kernel.run(*args, grid = (1,), warmup = True, **kwargs).metadata.shared
+
+
+def launch_compatible(kernel, grid, args, **kwargs) -> bool:
+    """Whether the device can actually load this exact launch.
+
+    Runs the launch with an empty grid: Triton still binds the arguments, resolves the
+    specialization and loads the module (so the shared-memory budget check executes), but no
+    program instance runs, so the kernel body never touches its tensors. This is the check that
+    fails at real launch time, which a compile-only probe can miss."""
     try:
-        compiled._init_handles()
+        kernel.run(*args, grid = grid, warmup = False, **kwargs)
+        return True
     except OutOfResources:
-        return float("inf")
-    return compiled.metadata.shared
+        return False
 
 
 def tile_ladder(block_m: int, block_n: int, num_warps: int, num_stages: int,

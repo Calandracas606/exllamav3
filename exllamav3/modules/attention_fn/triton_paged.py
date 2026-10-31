@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 
 from .common import AttnArgs, get_non_causal_span_arglist
-from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder
+from .smem import pick_config, shared_bytes, launch_compatible, tile_ladder, halving_ladder
 from ...util.backend import ROCM, gfx_arch, attn_decode_config
 
 
@@ -2128,7 +2128,16 @@ def paged_attn_triton_prefill(
         pick_key = (head_dim, hd_pad, qck, qcv, new_kv_mode, bool(causal), window_left >= 0,
                     window_right >= 0, has_sinks, stock)
         def probe(cfg):
-            _, args, nw, ns, *_ = prepare(cfg)
+            grid, args, nw, ns, *_ = prepare(cfg)
+            # The launch that will actually run is the authority. A compile-only footprint
+            # disagrees with what the load requires on some Triton builds (observed: a tile
+            # measuring BLOCK_M * HD_PAD * 2 at compile time needing BLOCK_M * HD_PAD * 4 when
+            # loaded), so a ladder driven by the compile number alone accepts tiles the launch
+            # then refuses with OutOfResources. An empty grid loads the module -- running the
+            # budget check -- without executing any program instance.
+            if not launch_compatible(_paged_attn_prefill_kernel, (0, 0, 0), args,
+                                     num_warps = nw, num_stages = ns):
+                return float("inf")
             return shared_bytes(_paged_attn_prefill_kernel, args, num_warps = nw, num_stages = ns)
         cfg = pick_config(q.device, "paged_attn_prefill", pick_key, candidates, probe)
 
