@@ -15,6 +15,7 @@ the compile the launch would have done anyway.
 
 import os
 import torch
+from triton.runtime.errors import OutOfResources
 
 _limit = {}
 # Test override: pretend the device grants at most this many bytes, to exercise the ladders on
@@ -86,9 +87,20 @@ def pick_config(device, name: str, key, candidates, probe):
 
 
 def shared_bytes(kernel, args, **kwargs) -> int:
-    """Compile-only warmup of a JIT kernel with the launch's real arguments; the launch grid does
-    not affect the footprint. The compile is cached by Triton, so the eventual launch reuses it."""
-    return kernel.run(*args, grid = (1,), warmup = True, **kwargs).metadata.shared
+    """Footprint of the load this argument tuple performs, in bytes.
+
+    A compile-only warmup is not a safe oracle. The budget check that actually fails lives in
+    CompiledKernel._init_handles(), which a warmup never calls, so a build that reports a smaller
+    footprint at warmup than at load lets an oversized tile through the ladder. Compile with a
+    warmup, then run that same load check directly: it raises OutOfResources on an oversized tile
+    and otherwise leaves the module loaded and ready, so the real launch reuses it. The kernel
+    body is never executed -- probing must not run attention over placeholder arguments."""
+    compiled = kernel.run(*args, grid = (1,), warmup = True, **kwargs)
+    try:
+        compiled._init_handles()
+    except OutOfResources:
+        return float("inf")
+    return compiled.metadata.shared
 
 
 def tile_ladder(block_m: int, block_n: int, num_warps: int, num_stages: int,
