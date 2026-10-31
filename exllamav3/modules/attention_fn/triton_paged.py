@@ -2126,8 +2126,16 @@ def paged_attn_triton_prefill(
         return grid, args, num_warps, num_stages, q_blocks, splits, partial_o, partial_ml, block_m, wide_index
 
     with torch.cuda.device(q.device):
+        # The footprint depends on the tile and on is_split, and is_split is not a property of the
+        # tile: prepare() sets it from `splits`, which is chosen from `programs` (q_len, bsz, head
+        # count) and the kv bound. So the same tile has a fp16 accumulator (the q placeholder) when
+        # there is no split and a fp32 one when there is, at double the footprint. Those launch
+        # inputs must be part of the key, or a pick measured under one of them is reused under
+        # another: a 4096 token chunk with splits=1 measures 65536 B and the 132 token remainder
+        # with splits=4 then launches that config at 131072 B, over the device's limit, mid-prefill.
         pick_key = (head_dim, hd_pad, qck, qcv, new_kv_mode, bool(causal), window_left >= 0,
-                    window_right >= 0, has_sinks, stock)
+                    window_right >= 0, has_sinks, stock, q_len, bsz, n_q_heads, num_pages_per_seq,
+                    kv_append_len)
         def probe(cfg):
             # The signature travels with the footprint: pick_config keeps it so a launch that fails
             # anyway can show whether it compiled the kernel this probe measured
