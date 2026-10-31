@@ -23,12 +23,58 @@ _env_limit = int(os.environ.get("EXL3_TRITON_SMEM_LIMIT", "0") or "0")
 # EXL3_TRITON_SMEM_DEBUG=1 prints every pick with its measured footprint
 _debug = bool(os.environ.get("EXL3_TRITON_SMEM_DEBUG"))
 _picks = {}
+# Per pick key, every candidate the walk actually probed and what the probe said, kept so a launch
+# that fails anyway can report the decision that admitted it instead of only the loader's complaint
+_probe_log = {}
 
 
 class NoFittingConfig(RuntimeError):
     """No candidate in a ladder fits the device's shared memory. Callers with an alternative
     formulation of the same computation catch this and take it; the miss is cached, so the
     probe cost is paid once per launch key."""
+
+
+def _get_probe_log(name: str, key):
+    """The (candidate, footprint) pairs measured while choosing under this launch key, or None."""
+    return _probe_log.get((name, key))
+
+
+NOTE_REASON = "smem-probe-miss"
+
+
+def _note_probe_miss(err: Exception, name: str, key, device, cfg) -> bool:
+    """Attach the walk that approved `cfg` to a launch-time OutOfResources, in place.
+
+    The loader reports only what it wanted. The walk reports what it measured for each candidate,
+    and that is what tells a report from a device we do not have apart: either the walk measured
+    this config as fitting (the probe and the load disagree for it), or it never measured it (the
+    pick came from cache under a different key), or it measured something else entirely.
+
+    Returns whether the note was attached; the exception is unchanged otherwise.
+    """
+    add_note = getattr(err, "add_note", None)
+    if add_note is None:
+        return False
+    limit = smem_limit(device)
+    log = _probe_log.get((name, key))
+    lines = [f"[{NOTE_REASON}] {name}: config {cfg} on a device granting {limit} B"]
+    if not log:
+        lines.append("  probe recorded nothing for this launch key: the config came from the pick "
+                     "cache, or the key differs between the pick and this launch")
+    else:
+        lines.append("  probe measured:")
+        for cand, need in log:
+            lines.append(f"    {cand}: {need} B")
+        if cfg not in [c for c, _ in log]:
+            lines.append(f"  {cfg} was never probed; the walk picked from {[c for c, _ in log]}")
+        elif all(need <= limit for _, need in log):
+            lines.append("  every probed candidate measured as fitting, so for at least one of them "
+                         "the compiled footprint and the footprint the loader accepts disagree")
+        else:
+            picked = dict(log).get(cfg)
+            lines.append(f"  {cfg} measured {picked} B, which fits {limit} B, yet the load failed")
+    add_note("\n".join(lines))
+    return True
 
 
 def _dev_index(device) -> int:
@@ -71,14 +117,18 @@ def pick_config(device, name: str, key, candidates, probe):
     if cfg is not ...:
         return cfg
     need = None
+    log = []
     for cand in candidates:
         need = probe(cand)
+        log.append((cand, need))
         if _debug:
             print(f" -- smem: {name} {key} config {cand}: {need} B ({'fits' if need <= limit else 'over'} {limit} B)", flush = True)
         if need <= limit:
             _picks[full_key] = cand
+            _probe_log[(name, key)] = log
             return cand
     _picks[full_key] = None
+    _probe_log[(name, key)] = log
     raise NoFittingConfig(
         f"{name}: no tile configuration fits the device's {limit} B of dynamic shared memory "
         f"(the smallest candidate needs {need} B)"

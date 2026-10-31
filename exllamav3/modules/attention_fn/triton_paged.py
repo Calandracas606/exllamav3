@@ -6,9 +6,10 @@ import torch
 
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 from .common import AttnArgs, get_non_causal_span_arglist
-from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder
+from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder, _note_probe_miss
 from ...util.backend import ROCM, gfx_arch, attn_decode_config
 
 
@@ -2218,7 +2219,15 @@ def paged_attn_triton_prefill(
                              n_kv_heads, page_size, head_dim)
 
         def launch(ns):
-            _paged_attn_prefill_kernel[grid](*args, num_warps = num_warps, num_stages = ns)
+            try:
+                _paged_attn_prefill_kernel[grid](*args, num_warps = num_warps, num_stages = ns)
+            except OutOfResources as e:
+                # The walk approved this config on a measurement the loader contradicts. Attach that
+                # measurement to the loader's own error: the exception type and message stay exactly
+                # as they were (callers test for OutOfResources), and the note says how the config
+                # was reached, which the loader's message cannot
+                _note_probe_miss(e, "paged_attn_prefill", pick_key, q.device, cfg)
+                raise
 
         if qc is not None and not num_stages_forced:
             if _qc_prefill_ns_env:
