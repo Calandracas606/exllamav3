@@ -77,7 +77,11 @@ def pick_config(device, name: str, key, candidates, probe):
             print(f" -- smem: {name} {key} config {cand}: {need} B ({'fits' if need <= limit else 'over'} {limit} B)", flush = True)
         if need <= limit:
             _picks[full_key] = cand
+            from . import smem_debug
+            smem_debug.log_pick(name, key, cand, need, limit, candidates)
             return cand
+    from . import smem_debug
+    smem_debug.log_pick(name, key, None, need, limit, candidates)
     _picks[full_key] = None
     raise NoFittingConfig(
         f"{name}: no tile configuration fits the device's {limit} B of dynamic shared memory "

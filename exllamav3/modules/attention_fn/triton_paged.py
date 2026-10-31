@@ -2218,7 +2218,19 @@ def paged_attn_triton_prefill(
                              n_kv_heads, page_size, head_dim)
 
         def launch(ns):
-            _paged_attn_prefill_kernel[grid](*args, num_warps = num_warps, num_stages = ns)
+            try:
+                _paged_attn_prefill_kernel[grid](*args, num_warps = num_warps, num_stages = ns)
+            except Exception:
+                # Debug: the ladder accepted a cfg the driver rejects, so the probe measured a
+                # different compile than this launch. Report which candidates actually launch.
+                from . import smem_debug
+                if smem_debug.enabled():
+                    rows = smem_debug.retry_ladder_with_launches(
+                        _paged_attn_prefill_kernel, "paged_attn_prefill", prepare, candidates,
+                    )
+                    print(f" -- smem-trace: picked cfg={cfg} failed to launch (num_stages={ns}); "
+                          f"real-launch verdict per candidate: {rows}", flush = True)
+                raise
 
         if qc is not None and not num_stages_forced:
             if _qc_prefill_ns_env:
@@ -2268,6 +2280,13 @@ def fn_triton_attn_nocache(args: AttnArgs) -> torch.Tensor | None:
         k_new = args.k,
         v_new = args.v,
     )
+
+
+# Debug: EXL3_SMEM_TRACE=1 records every compile of the paged-attention kernels, so a probe that
+# under-reports the launch footprint is observed rather than inferred. No-op when unset.
+from . import smem_debug as _smem_debug
+_smem_debug.instrument(_paged_attn_prefill_kernel, "prefill")
+_smem_debug.instrument(_paged_attn_prefill_combine_kernel, "prefill-combine")
 
 
 def fn_triton_paged_attn_prefill(args: AttnArgs) -> torch.Tensor | None:
