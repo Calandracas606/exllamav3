@@ -76,10 +76,22 @@ def _qwen38_layer_types() -> list[str]:
 
 
 def _gdn_probe_class() -> type:
-    return _optimizer_probe_class(
+    """The GatedDeltaNet class reduced to optimizer_targets, with the split-projection layout.
+
+    The probe keeps only optimizer_targets(), so __init__ never runs and the instance attributes
+    the method reads have to be supplied by the caller. kda_direct is one: __init__ sets it to
+    key_f is not None, and when true the method also measures the separate f_proj and g_proj.
+    These tests build the split layout (qkv_proj/z_proj, no f/g pair), so it is False.
+    """
+    cls = _optimizer_probe_class(
         "exllamav3/modules/gated_delta_net.py",
         "GatedDeltaNet",
     )
+
+    class GatedDeltaNetProbe(cls):
+        kda_direct = False
+
+    return GatedDeltaNetProbe
 
 
 def _linear(key: str) -> SimpleNamespace:
