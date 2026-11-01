@@ -46,6 +46,9 @@ def test_prepare_inputs_sets_anchor_and_uses_dflash_attention_setup():
     # preparation, plus the anchor ids for the selector walk
     for is_causal, expected in ((None, False), (False, False), (True, True)):
         model.config = SimpleNamespace(is_causal = is_causal)
+        # prepare_inputs only takes the recurrent-state path when the model has a state class, which
+        # __init__ leaves None unless a layer is a sliding-window one; the bare object has no __init__
+        model.recurrent_state_cls = None
         params = {}
         with patch.object(arch, "prepare_for_attn", return_value = prepared) as prepare:
             actual = DFlash2Model.prepare_inputs(model, input_ids, params)
