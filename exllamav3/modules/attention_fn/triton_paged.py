@@ -2125,8 +2125,30 @@ def paged_attn_triton_prefill(
         return grid, args, num_warps, num_stages, q_blocks, splits, partial_o, partial_ml, block_m, wide_index
 
     with torch.cuda.device(q.device):
+        # The footprint depends on more than the tile: prepare() sets is_split from `splits`, which
+        # follows `programs` and the kv bound, and is_split swaps a fp16 placeholder accumulator for
+        # a real fp32 one at twice the size. A long prefill is chunked, so one request reaches this
+        # kernel at several q_len; while those were absent from the key the pick measured for the
+        # first chunk was reused for the rest, and a 4096 token chunk with splits=1 (65536 B)
+        # admitted a 132 token remainder with splits=4 that launched at 131072 B on a device
+        # granting 65536 B, aborting the prefill after it had started.
+        #
+        # Only three quantities decide it, so key on those rather than on every input they derive
+        # from (each measured to be equivalent: q_len only acts through q_blocks, bsz and n_q_heads
+        # only through their product, the kv page count and append length only through their sum):
+        #   programs  = q_blocks * bsz * n_q_heads
+        #   bound_kv  = num_pages_per_seq * page_size + kv_append_len
+        # q_blocks itself is not available here (it needs block_m, which is what we are choosing),
+        # so use q_len quantized the way Triton specialises integers -- it distinguishes only ==1
+        # and %16 -- which keeps the key no finer than the kernels it selects between, holding the
+        # probe count to a couple per request instead of one per chunk.
+        q_len_bucket = 1 if q_len == 1 else (q_len % 16 == 0)
+        kv_bound = num_pages_per_seq * page_size + kv_append_len
+        if max_kv_len is not None:
+            # min() with the caller's clamp, exactly as prepare() bounds it
+            kv_bound = min(kv_bound, max_kv_len + kv_append_len)
         pick_key = (head_dim, hd_pad, qck, qcv, new_kv_mode, bool(causal), window_left >= 0,
-                    window_right >= 0, has_sinks, stock)
+                    window_right >= 0, has_sinks, stock, q_len_bucket, bsz * n_q_heads, kv_bound)
         def probe(cfg):
             _, args, nw, ns, *_ = prepare(cfg)
             return shared_bytes(_paged_attn_prefill_kernel, args, num_warps = nw, num_stages = ns)
