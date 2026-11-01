@@ -77,16 +77,78 @@ def test_input_embedding_scale_is_applied():
 
 
 @pytest.mark.nogpu
-def test_tp_target_is_rejected_during_attach():
+def test_tp_target_is_accepted_during_attach():
+    """TP targets are supported since 9cc3bd15: the selector's top-k runs per rank over each
+    rank's vocabulary slice and only the k candidates cross ranks, so attach_to no longer
+    refuses a TP target. It still validates the shape properties it needs."""
     model = object.__new__(DFlash2Model)
-    target = SimpleNamespace(loaded_tp = True)
+    model.config = SimpleNamespace(
+        vocab_size = 32, hidden_size = 16, mask_token_id = 3, target_layer_ids = [0, 1])
+    class Target:
+        loaded_tp = True
+        logit_layer_idx = 0
+        config = SimpleNamespace(vocab_size = 32, hidden_size = 16, num_hidden_layers = 4)
 
-    try:
-        model.attach_to(target)
-    except NotImplementedError as exc:
-        assert "tensor-parallel targets" in str(exc)
-    else:
-        raise AssertionError("DFlash2 attached to a tensor-parallel target")
+    target = Target()
+    model.attached_model = None
+    model.input_layer = SimpleNamespace(attached_model = None)
+
+    DFlash2Model.attach_to(model, target)
+
+    assert model.attached_model() is target
+    assert model.input_layer.attached_model() is target
+
+
+@pytest.mark.nogpu
+def test_tp_sample_dispatches_topk_per_rank_instead_of_logits():
+    """On a TP target the drafter must never materialise full logits: each rank reduces to the
+    selector's top-k over its own vocabulary slice and the candidates come back merged."""
+    class Selector:
+        device = torch.device("cpu")
+        top_k = 2
+
+        def walk_candidates(self, hidden, unary, cands, anchor, return_confidence = False):
+            self.seen = (unary, cands)
+            return torch.tensor([[1, 2]]), None
+
+    calls = {}
+
+    class Target:
+        loaded_tp = True
+
+        class tp_producer:
+            @staticmethod
+            def send(state):
+                calls["staged"] = state
+                return state
+
+        @staticmethod
+        def tp_dispatch_lm_head_topk(args, top_k, scale = 1.0, softcap = 0.0):
+            calls["top_k"] = top_k
+            calls["scale"] = scale
+            calls["softcap"] = softcap
+            unary = torch.zeros(1, 2, dtype = torch.float)
+            cands = torch.zeros(1, 2, dtype = torch.long)
+            return unary, cands
+
+        modules = []
+        logit_layer_idx = 0
+
+    selector = Selector()
+    model = object.__new__(DFlash2Model)
+    model.config = SimpleNamespace(output_multiplier = 2.0, final_logit_softcapping = 3.0)
+    model.attached_model = lambda: Target()
+    model.selector = selector
+    params = {"dflash2_anchor_ids": torch.tensor([[1]])}
+
+    ids = DFlash2Model.sample_from_state(model, torch.zeros(1, 2, 4), params)
+
+    assert ids.tolist() == [[1, 2]]
+    # The per-rank reduction got the selector's k and the applied scale/softcap
+    assert calls["top_k"] == 2
+    assert calls["scale"] == 2.0
+    assert calls["softcap"] == 3.0
+    assert "staged" in calls
 
 
 @pytest.mark.nogpu
