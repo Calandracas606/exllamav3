@@ -364,6 +364,8 @@ def test_dflash2_block_keeps_fp32_residual_and_fp16_branches():
 @pytest.mark.nogpu
 def test_candidate_logit_scale_and_softcap_are_applied():
     class LMHead:
+        sparse_head = None
+
         def prepare_for_device(self, state, params):
             return state
 
@@ -403,6 +405,8 @@ def test_candidate_logit_scale_and_softcap_are_applied():
 @pytest.mark.nogpu
 def test_sample_exports_selector_confidence_for_dynamic_drafting():
     class LMHead:
+        sparse_head = None
+
         def prepare_for_device(self, state, params):
             return state
 
